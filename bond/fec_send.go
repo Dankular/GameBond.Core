@@ -55,8 +55,10 @@ func (s *Sender) protectionLevel(paths []*receivePath, now time.Time) protection
 // on a second ready path or folds it into the flow's parity group.
 func (s *Sender) bulkProtect(f *sendFlow, number uint64, payload []byte, used *receivePath, now time.Time, writer DatagramWriter) {
 	if f.striped {
-		f.fecMask = 0
+		// One copy of each packet, so loss is covered by parity (12.5% at one row, more as loss
+		// heats up) sent on a different path from the data, plus the repair cache.
 		s.stats.HeavyStriped++
+		s.accumulateParity(f, number, payload, used, s.eligible(now, true), now, writer)
 		return
 	}
 	paths := s.eligible(now, true)

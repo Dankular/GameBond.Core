@@ -44,6 +44,9 @@ func TestHeavyFlowIsStripedAndSlowFlowDuplicated(t *testing.T) {
 	if s.StripedFlows() != 1 || s.Stats().HeavyStriped == 0 {
 		t.Fatalf("heavy flow not striped: %+v", s.Stats())
 	}
+	if s.Stats().ParitySent == 0 {
+		t.Fatalf("striped flow has no parity protection: %+v", s.Stats())
+	}
 	if len(used) != 2 {
 		t.Fatalf("striping used %d path(s)", len(used))
 	}
