@@ -61,7 +61,7 @@ func (s *Sender) bulkProtect(f *sendFlow, number uint64, payload []byte, used *r
 		s.accumulateParity(f, number, payload, used, s.eligible(now, true), now, writer)
 		return
 	}
-	paths := s.eligible(now, true)
+	paths := s.copyPaths(now, true)
 	level := s.protectionLevel(paths, now)
 	// A copy that cannot be placed falls back to a parity group, so the packet is still
 	// recoverable from one loss.
@@ -88,7 +88,7 @@ func (s *Sender) other(used *receivePath, paths []*receivePath, size int, now ti
 	var best *receivePath
 	bestScore := math.Inf(1)
 	for _, p := range s.fitPaths(paths, size) {
-		if p == used || s.atRisk(p, now) {
+		if p == used || (!ungated && s.atRisk(p, now)) {
 			continue
 		}
 		if !ungated {

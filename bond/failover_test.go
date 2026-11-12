@@ -117,8 +117,11 @@ func TestFailoverReplaysBlackholedUplink(t *testing.T) {
 	}
 	before := wire[1]
 	send(30)
-	if wire[1] != before {
-		t.Fatalf("bulk still used the suspect path (%d frames)", wire[1]-before)
+	// First copies keep off the suspect path; redundancy copies may still go there, one
+	// per packet at most, because a copy into a dead line costs only bandwidth while
+	// withholding it leaves the live line as the only copy.
+	if got := wire[1] - before; got > 30 {
+		t.Fatalf("suspect path carried %d frames for 30 packets: more than one copy each", got)
 	}
 	drop[1] = false
 	for i := 0; i < 80; i++ {

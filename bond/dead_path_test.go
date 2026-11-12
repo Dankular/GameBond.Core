@@ -59,3 +59,38 @@ func TestExpectedCopyPathsAreCachedBetweenRefreshes(t *testing.T) {
 		t.Fatalf("cache not refreshed: %d", got)
 	}
 }
+
+// A bulk packet still gets its second copy when BFD has declared the other line down:
+// BFD is wrong whenever load starves its frames on a jittery link, and a copy into a
+// really dead line costs only bandwidth. The first copy keeps off the down line.
+func TestBulkCopyStillGoesToBFDDownPath(t *testing.T) {
+	f, s, a := senderFixture(t, 2)
+	s.lossTiered = false
+	for _, k := range a {
+		f.r.paths[pk(k)].last = f.now
+	}
+	var to []string
+	write := func(d Datagram) error { to = append(to, d.Endpoint.String()); return nil }
+	markBFDDown(f.r.paths[pk(a[0])])
+	sent := 0
+	for i := 0; i < 2000 && sent < 8; i++ {
+		now := f.now.Add(time.Duration(i) * time.Millisecond)
+		for _, k := range a {
+			f.r.paths[pk(k)].last = now
+		}
+		if ok, _, err := s.Bulk(udpOfSize(400), "flow", now, write); err != nil {
+			t.Fatal(err)
+		} else if ok {
+			sent++
+		}
+	}
+	down := 0
+	for _, e := range to {
+		if e == a[0].String() {
+			down++
+		}
+	}
+	if sent != 8 || len(to) != 16 || down != 8 {
+		t.Fatalf("sent %d packets as %d frames, %d to the BFD-down path; want 8 packets, 16 frames, 8 copies on the down path", sent, len(to), down)
+	}
+}

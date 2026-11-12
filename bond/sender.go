@@ -196,6 +196,18 @@ func (s *Sender) eligible(now time.Time, boost bool) []*receivePath {
 	return s.eligibleWith(now, boost, false)
 }
 
+// copyPaths is every path a redundancy copy may use. BFD "down" and its hold-down only
+// keep first copies off a flapping line: a duplicate sent into a line that is really
+// dead costs bandwidth and nothing else, while withholding it when BFD is wrong (heavy
+// load on a jittery link starves its frames) leaves the one remaining line as the only
+// copy, so any loss there is permanent. A path silent for 3 s is still left out.
+func (s *Sender) copyPaths(now time.Time, boost bool) []*receivePath {
+	if paths := s.eligibleWith(now, boost, false); len(paths) > 0 {
+		return paths
+	}
+	return s.eligibleWith(now, boost, true)
+}
+
 func (s *Sender) eligibleWith(now time.Time, boost, skipDown bool) []*receivePath {
 	var all, primary, secondary, backup []*receivePath
 	for _, p := range s.r.paths {

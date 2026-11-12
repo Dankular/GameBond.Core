@@ -226,8 +226,10 @@ func TestTCPPresetFallsBackToParityWhenNoCopyFits(t *testing.T) {
 			sent++
 		}
 	}
-	if s.Stats().BulkDupSkipped == 0 || parity == 0 || s.Stats().ParitySent == 0 {
-		t.Fatalf("no parity fallback: skipped=%d parity=%d %+v", s.Stats().BulkDupSkipped, parity, s.Stats())
+	// Quiet links no longer withhold the copy: a duplicate sent into a quiet line costs
+	// bandwidth only, while skipping it leaves one copy for first-arrival to use.
+	if st := s.Stats(); st.BulkDuplicates != 16 || st.BulkDupSkipped != 0 {
+		t.Fatalf("quiet links must still take a copy: duplicates=%d skipped=%d parity=%d %+v", st.BulkDuplicates, st.BulkDupSkipped, parity, st)
 	}
 }
 
