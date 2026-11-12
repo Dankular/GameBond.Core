@@ -31,6 +31,11 @@ type budgetPending struct {
 	lost bool
 }
 
+// growthLossCeiling is the loss ratio above which a path stops growing. Random loss
+// of a few percent (a LEO link) is not congestion: real congestion is caught by the
+// corroborated test, so growth only pauses once loss is clearly heavy.
+const growthLossCeiling = .05
+
 // BaseRTTWindow is the seconds per bucket of the decaying delay baseline.
 const BaseRTTWindow = 10.0
 
@@ -546,7 +551,7 @@ func (b *Budget) measure(now float64) {
 	} else if b.delayControl && b.delaySamples >= 3 && (!b.appLimited || (b.delayAssertive && utilization >= .5)) {
 		b.reduceForDelay(now)
 	}
-	if !b.growthAppLimited && b.delaySamples == 0 && !corroborated && b.lossRatio < .01 && pressure < .25 && allowance > 0 && b.epochDelivered >= 6000 && b.epochRetired >= 6000 && b.epochDelivered >= allowance*.65 && now-b.lastBackoff >= math.Max(.25, b.rawSRTT) {
+	if !b.growthAppLimited && b.delaySamples == 0 && !corroborated && b.lossRatio < growthLossCeiling && pressure < .25 && allowance > 0 && b.epochDelivered >= 6000 && b.epochRetired >= 6000 && b.epochDelivered >= allowance*.65 && now-b.lastBackoff >= math.Max(.25, b.rawSRTT) {
 		increment := 12500.
 		if b.startup {
 			increment = math.Max(12500, math.Min(b.rate*.5, 1250000))

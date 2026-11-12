@@ -14,8 +14,8 @@ func TestCoDelLeavesShortQueuesAloneAndActsOnStandingDelay(t *testing.T) {
 		}
 	}
 	var drops, marks int
-	for i := 0; i < 100; i++ { // 1 s of 40 ms standing delay
-		switch c.judge("g", 40*time.Millisecond, i%2 == 0, t0.Add(time.Duration(i)*10*time.Millisecond)) {
+	for i := 0; i < 200; i++ { // 2 s of 120 ms standing delay
+		switch c.judge("g", 120*time.Millisecond, i%2 == 0, t0.Add(time.Duration(i)*10*time.Millisecond)) {
 		case codelDrop:
 			drops++
 		case codelMark:

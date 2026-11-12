@@ -12,11 +12,13 @@ import (
 // negotiated ECN, otherwise dropped, and the rate of marks/drops rises with the
 // square root of the count until the delay falls. Queue time includes time spent held
 // back by pacing or the congestion window, which is exactly the standing queue that
-// builds on the slow uplink.
+// builds on the slow uplink. The target and interval are sized for a LEO path (round
+// trips of 50-150 ms with jitter): a 12 ms / 120 ms setting treated every burst held
+// behind the rate limit as a standing queue and dropped it, so TCP collapsed.
 
 const (
-	codelTarget   = 12 * time.Millisecond
-	codelInterval = 120 * time.Millisecond
+	codelTarget   = 50 * time.Millisecond
+	codelInterval = 300 * time.Millisecond
 )
 
 type codelFlow struct {
