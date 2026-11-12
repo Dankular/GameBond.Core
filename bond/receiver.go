@@ -800,6 +800,11 @@ func (r *Receiver) updateReorderBudget() {
 	if r.skewSamples >= 200 {
 		timeout = math.Min(timeout, math.Max(r.reorderBase.Seconds(), 2*r.skewPeakMS/1000+4*jitter))
 	}
+	// A hole is the slower path's copy: wait for its spread plus jitter, never the whole
+	// budget, so a jittery Starlink path cannot hold every segment back.
+	if count >= 2 {
+		timeout = math.Min(timeout, math.Max(r.reorderBase.Seconds(), (maximum-minimum)/2+4*jitter))
+	}
 	r.reorder.config.Timeout = time.Duration(timeout * float64(time.Second))
 	udp := timeout
 	if count >= 2 {

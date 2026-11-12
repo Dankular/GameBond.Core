@@ -22,12 +22,22 @@ func TestUDPFirstArrivalIsNotHeldBehindAHole(t *testing.T) {
 	}
 }
 
-func TestTCPStillWaitsForTheHole(t *testing.T) {
+func TestTCPFirstArrivalAndOptOutWaits(t *testing.T) {
 	r := reorderForTest(t, DefaultReorderConfig())
 	now := time.Now()
 	r.Push(1, 0, tcpPacket("a"), now)
+	if got := r.Push(1, 2, tcpPacket("c"), now); len(got) != 1 {
+		t.Fatalf("TCP held behind a hole: %d delivered", len(got))
+	}
+	if got := r.Push(1, 1, tcpPacket("b"), now); len(got) != 1 {
+		t.Fatalf("late TCP original not delivered: %d", len(got))
+	}
+	cfg := DefaultReorderConfig()
+	cfg.FirstArrivalTCP = false
+	r = reorderForTest(t, cfg)
+	r.Push(1, 0, tcpPacket("a"), now)
 	if got := r.Push(1, 2, tcpPacket("c"), now); len(got) != 0 {
-		t.Fatal("TCP delivered ahead of a hole")
+		t.Fatal("opted-out TCP delivered ahead of a hole")
 	}
 }
 

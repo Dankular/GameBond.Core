@@ -20,7 +20,22 @@ type heldPacket struct {
 	payload []byte
 	at      time.Time
 }
+// holeRange is a run of numbers skipped on first arrival: not held, but still asked for
+// from the peer's repair cache if neither copy turns up.
+type holeRange struct {
+	from, to uint64
+	at       time.Time
+	probe    []byte
+}
+
+const (
+	maxHoles    = 64
+	maxHoleSpan = 4096
+	holeLife    = 2 * time.Second
+)
+
 type orderedFlow struct {
+	holes        []holeRange
 	id, expected uint64
 	exhausted    bool
 	seen         ReplayWindow
@@ -42,10 +57,15 @@ type ReorderConfig struct {
 	// do, instead of holding it behind a hole. The skipped numbers are still accepted if they
 	// show up later (AllowLate).
 	FirstArrivalUDP bool
+	// FirstArrivalTCP does the same for TCP. A hole in a bonded flow is almost always the
+	// slower path's copy still in flight, so holding the flow behind it only adds that path's
+	// delay (and its jitter) to every segment; TCP tolerates the brief reordering, and the
+	// skipped segment is still delivered when it lands.
+	FirstArrivalTCP bool
 }
 
 func DefaultReorderConfig() ReorderConfig {
-	return ReorderConfig{1024, 2048, 4 * 1024 * 1024, 30 * time.Millisecond, 120 * time.Second, true, 0, true}
+	return ReorderConfig{1024, 2048, 4 * 1024 * 1024, 30 * time.Millisecond, 120 * time.Second, true, 0, true, true}
 }
 
 type ReorderStats struct {
@@ -239,9 +259,15 @@ func (r *Reorder) Push(id, number uint64, payload []byte, now time.Time) [][]byt
 		r.stats.Delivered++
 		r.advance(f, number)
 		r.drain(f, &out)
-	} else if r.config.Timeout == 0 || len(payload) > r.config.MaxBytes || (r.config.FirstArrivalUDP && ipProto(payload) == 17) {
+	} else if r.config.Timeout == 0 || len(payload) > r.config.MaxBytes || (r.config.FirstArrivalUDP && ipProto(payload) == 17) || (r.config.FirstArrivalTCP && ipProto(payload) == 6) {
 		for len(f.numbers) > 0 && f.numbers[0] < number {
 			r.flush(f, &out, true)
+		}
+		if number > f.expected && number-f.expected <= maxHoleSpan && ipProto(payload) == 6 {
+			if len(f.holes) >= maxHoles {
+				f.holes = f.holes[1:]
+			}
+			f.holes = append(f.holes, holeRange{f.expected, number, now, append([]byte(nil), payload...)})
 		}
 		r.gap(f, number, payload)
 		r.advance(f, number)
@@ -307,6 +333,22 @@ func (r *Reorder) Missing(now time.Time, delay time.Duration, limit int, predica
 	}
 	for e := r.lru.Front(); e != nil && len(out) < limit; e = e.Next() {
 		f := e.Value.(*orderedFlow)
+		kept := f.holes[:0]
+		for _, h := range f.holes {
+			if now.Sub(h.at) > holeLife {
+				continue
+			}
+			kept = append(kept, h)
+			if now.Before(h.at.Add(delay)) || (predicate != nil && !predicate(h.probe)) {
+				continue
+			}
+			for n := h.from; n < h.to && len(out) < limit; n++ {
+				if f.seen.Check(n) == ReplayNew {
+					out = append(out, MissingPacket{f.id, n})
+				}
+			}
+		}
+		f.holes = kept
 		if len(f.numbers) == 0 || now.Before(f.deadline.Add(delay-r.config.Timeout)) || (predicate != nil && !predicate(f.pending[f.numbers[0]].payload)) {
 			continue
 		}
