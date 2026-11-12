@@ -53,6 +53,22 @@ func (b *bfdState) hears(now time.Time) bool {
 	return b.seen && now.Sub(b.rx) < bfdMultiplier*bfdInterval
 }
 
+// bfdHears reports whether this end has heard the peer within the detect time. Any authenticated
+// frame from the peer on the path counts, not only a BFD frame: a loaded or lossy line can eat five
+// BFD frames in a row (or hold them in a queue behind bulk) while data, probes and feedback keep
+// arriving, and declaring that line down throws away a working path. A line that really stopped
+// delivers nothing at all, so it is still detected within the same time.
+func (p *receivePath) bfdHears(now time.Time) bool {
+	if !p.bfd.seen {
+		return false
+	}
+	latest := p.bfd.rx
+	if p.last.After(latest) {
+		latest = p.last
+	}
+	return now.Sub(latest) < bfdMultiplier*bfdInterval
+}
+
 // bfdReceived records a BFD frame from the peer.
 func (r *Receiver) bfdReceived(p *receivePath, payload []byte, now time.Time) {
 	p.bfd.seen, p.bfd.rx = true, now
@@ -67,7 +83,7 @@ func (r *Receiver) bfdEvaluate(p *receivePath, now time.Time) {
 	if !b.seen {
 		return
 	}
-	both := b.hears(now) && b.peerHears
+	both := p.bfdHears(now) && b.peerHears
 	wentDown, cameUp := false, false
 	switch {
 	case !both:
@@ -82,7 +98,7 @@ func (r *Receiver) bfdEvaluate(p *receivePath, now time.Time) {
 			b.flaps++
 			b.lastDown = now
 			b.cause = "peer_not_hearing_us"
-			if !b.hears(now) {
+			if !p.bfdHears(now) {
 				b.cause = "silence"
 			}
 		}
@@ -114,7 +130,7 @@ func (r *Receiver) bfdSend(p *receivePath, now time.Time, out *ReceiveResult) er
 	p.bfd.lastTx = now
 	r.bfdEvaluate(p, now)
 	var body [bfdPayload]byte
-	if p.bfd.hears(now) {
+	if p.bfdHears(now) {
 		body[0] = 1
 	}
 	body[1] = bfdMultiplier

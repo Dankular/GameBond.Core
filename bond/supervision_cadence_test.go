@@ -129,3 +129,44 @@ func TestSupervisionDoesNotRetryAgainstASilentOldPeer(t *testing.T) {
 		t.Fatalf("%d announcements in 20 s against a silent peer, want about 10", sent)
 	}
 }
+
+// A line that loses or delays its BFD frames while data, probes and feedback still arrive is
+// lossy, not dead. It must stay up (and keep carrying copies) rather than be declared down for
+// "peer_not_hearing_us" every time a burst eats five BFD frames in a row.
+func TestBFDFrameLossDoesNotDownALineThatStillDelivers(t *testing.T) {
+	p := supervisionPair(t)
+	downs := func() (n uint64) {
+		for _, side := range []*Receiver{p.client, p.server} {
+			for _, path := range side.paths {
+				n += path.bfd.downs
+			}
+		}
+		return n
+	}
+	before := downs()
+	p.lose = func(fromClient bool, local int, kind byte) bool { return kind == BFD && local == 0 }
+	for i := 0; i < 24; i++ { // 6 s with every BFD frame on link 0 lost, both directions
+		p.step()
+	}
+	if got := downs() - before; got != 0 {
+		t.Fatalf("%d BFD downs although probes and feedback kept arriving", got)
+	}
+}
+
+// A line that really stops delivering is still detected within the BFD detect time.
+func TestBFDStillDetectsADeadLine(t *testing.T) {
+	p := supervisionPair(t)
+	p.drop[0] = true
+	var down bool
+	for i := 0; i < 4 && !down; i++ { // up to 1 s
+		p.step()
+		for _, path := range p.server.paths {
+			if path.local == 0 && path.bfdDown() {
+				down = true
+			}
+		}
+	}
+	if !down {
+		t.Fatal("a dead line was not declared down within 1 s")
+	}
+}
