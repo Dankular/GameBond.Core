@@ -543,8 +543,10 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 			p.hasEpoch = true
 			p.stripeBytes = 0
 			p.stripeAt = time.Time{}
+			p.sack = sackWindow{}
 		}
 		if p.rxEpoch == epoch {
+			p.sack.Note(h.Sequence)
 			p.stripeBytes += uint64(len(frame))
 			if p.stripeAt.IsZero() || h.Sequence > p.stripeHighest {
 				p.stripeHighest = h.Sequence
@@ -636,7 +638,9 @@ func (r *Receiver) Tick(now time.Time) (ReceiveResult, error) {
 		if !p.lastFeedback.IsZero() && now.Sub(p.lastFeedback) < interval {
 			continue
 		}
-		payload := make([]byte, 28)
+		// The frame carries a bitmap of the sequences received on this path, so the peer
+		// learns exactly which frames were lost instead of waiting out a timer.
+		payload := make([]byte, feedbackSackSize)
 		binary.BigEndian.PutUint64(payload, p.rxEpoch)
 		binary.BigEndian.PutUint64(payload[8:], p.stripeHighest)
 		binary.BigEndian.PutUint64(payload[16:], p.stripeBytes)
@@ -648,6 +652,9 @@ func (r *Receiver) Tick(now time.Time) (ReceiveResult, error) {
 			hold = 1000000
 		}
 		binary.BigEndian.PutUint32(payload[24:], uint32(hold))
+		base, bits := p.sack.Report()
+		binary.BigEndian.PutUint64(payload[28:], base)
+		copy(payload[36:], bits)
 		if err := r.write(Feedback, payload, p.local, p.endpoint, &out); err != nil {
 			return out, err
 		}
