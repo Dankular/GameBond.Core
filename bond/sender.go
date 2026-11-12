@@ -26,6 +26,10 @@ type sendFlow struct {
 	fecRS   [fecMaxRows][]byte
 	// flow pinning (pin.go)
 	pin, backup *receivePath
+	// heavy-flow striping (stripe.go)
+	rateAt      time.Time
+	rateBytes   int
+	striped     bool
 }
 
 // Loss steering: measured loss at or above lossSteerRatio, measured within lossSteerLife
@@ -37,7 +41,7 @@ const (
 )
 
 type SenderStats struct {
-	PayloadPackets, PayloadBytes, Copies, StripedPackets, PriorityCopies, TCPControlPackets, WireLimited, SocketErrors, RepairCopies, RepairRequests, RepairUnavailableSent, RepairExhausted, RepairThrottled, MTUNoFit, FailoverSuspected, FailoverRecovered, FailoverReplayed, FailoverReplayDropped, LossSteered, BulkDuplicates, BulkDupSkipped, ParitySent, FlowsPinned, FastReroutes, PinSpills uint64
+	PayloadPackets, PayloadBytes, Copies, StripedPackets, PriorityCopies, TCPControlPackets, WireLimited, SocketErrors, RepairCopies, RepairRequests, RepairUnavailableSent, RepairExhausted, RepairThrottled, MTUNoFit, FailoverSuspected, FailoverRecovered, FailoverReplayed, FailoverReplayDropped, LossSteered, BulkDuplicates, BulkDupSkipped, ParitySent, FlowsPinned, FastReroutes, PinSpills, HeavyStriped uint64
 	// Selective-acknowledgement loss handling: frames seen lost on a path, answered by an
 	// immediate resend, held back because a sibling copy may still arrive, or not
 	// recoverable (no cached payload: UDP, or too old).
@@ -77,6 +81,7 @@ type Sender struct {
 	repairTokensAt    time.Time
 	failover          bool
 	pinning           bool
+	stripeMbps        float64
 	lossTiered        bool // tests only: loss-driven parity/duplication instead of always duplicating
 	lossTracking      bool
 	replayQueue       []replayItem
@@ -579,7 +584,8 @@ func (s *Sender) Bulk(payload []byte, key string, now time.Time, writer Datagram
 	if err != nil {
 		return false, now, err
 	}
-	if s.pinning {
+	s.noteFlowRate(f, len(payload), now)
+	if s.pinning && !f.striped {
 		chosen, at := s.pinChoose(f, paths, available, ready, timestamp)
 		if chosen == nil {
 			wait := time.Millisecond
