@@ -54,7 +54,7 @@ func (s *Sender) protectionLevel(paths []*receivePath, now time.Time) protection
 // bulkProtect runs after a bulk packet was sent on used: it duplicates the packet
 // on a second ready path or folds it into the flow's parity group.
 func (s *Sender) bulkProtect(f *sendFlow, number uint64, payload []byte, used *receivePath, now time.Time, writer DatagramWriter) {
-	if f.striped {
+	if f.stripeOn {
 		// One copy of each packet, so loss is covered by parity (12.5% at one row, more as loss
 		// heats up) sent on a different path from the data, plus the repair cache.
 		s.stats.HeavyStriped++

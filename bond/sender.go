@@ -29,7 +29,8 @@ type sendFlow struct {
 	// heavy-flow striping (stripe.go)
 	rateAt      time.Time
 	rateBytes   int
-	striped     bool
+	striped     bool // rate says heavy
+	stripeOn    bool // heavy and every path calm: actually striped
 }
 
 // Loss steering: measured loss at or above lossSteerRatio, measured within lossSteerLife
@@ -82,6 +83,9 @@ type Sender struct {
 	failover          bool
 	pinning           bool
 	stripeMbps        float64
+	calmUntil         time.Time
+	calmChecked       time.Time
+	calm              bool
 	lossTiered        bool // tests only: loss-driven parity/duplication instead of always duplicating
 	lossTracking      bool
 	replayQueue       []replayItem
@@ -585,7 +589,7 @@ func (s *Sender) Bulk(payload []byte, key string, now time.Time, writer Datagram
 		return false, now, err
 	}
 	s.noteFlowRate(f, len(payload), now)
-	if s.pinning && !f.striped {
+	if s.pinning && !f.stripeOn {
 		chosen, at := s.pinChoose(f, paths, available, ready, timestamp)
 		if chosen == nil {
 			wait := time.Millisecond
