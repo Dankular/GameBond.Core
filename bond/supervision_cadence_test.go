@@ -170,3 +170,94 @@ func TestBFDStillDetectsADeadLine(t *testing.T) {
 		t.Fatal("a dead line was not declared down within 1 s")
 	}
 }
+
+// stepBy advances the pair by d and ticks both sides, like a loop that wakes more often than the
+// default 250 ms test step.
+func (p *clientServerPair) stepBy(d time.Duration) {
+	p.now = p.now.Add(d)
+	co, err := p.client.Tick(p.now)
+	if err != nil {
+		p.t.Fatal(err)
+	}
+	p.deliver(true, co)
+	so, err := p.server.Tick(p.now)
+	if err != nil {
+		p.t.Fatal(err)
+	}
+	p.deliver(false, so)
+}
+
+// A line that stops delivering is declared down within the calm-line detect time plus one BFD
+// interval on the far side, measured with a loop that ticks every 5 ms.
+func TestBFDDetectsADeadLineInUnder250ms(t *testing.T) {
+	p := newClientServerPair(t)
+	for i := 0; i < 12 && p.readyClientPaths() < 2; i++ {
+		p.step()
+	}
+	for i := 0; i < 400; i++ { // 2 s of steady state at 5 ms
+		p.stepBy(5 * time.Millisecond)
+	}
+	p.drop[0] = true
+	start := p.now
+	var took time.Duration
+	for took = 0; took < time.Second; took = p.now.Sub(start) {
+		p.stepBy(5 * time.Millisecond)
+		down := 0
+		for _, side := range []*Receiver{p.client, p.server} {
+			for _, path := range side.paths {
+				if path.local == 0 && path.bfdDown() {
+					down++
+				}
+			}
+		}
+		if down == 2 { // both ends have declared it
+			break
+		}
+	}
+	t.Logf("both ends declared the dead line down after %v", took)
+	if took > 250*time.Millisecond {
+		t.Fatalf("dead line took %v to detect on both ends, want at most 250ms", took)
+	}
+}
+
+// The detect time follows the line: after a line shows a 120 ms stall that was not a failure, a
+// 170 ms silence is within what that line does, while a calm line is declared down at once.
+func TestBFDDetectTimeWidensToTheLinesOwnJitter(t *testing.T) {
+	run := func(stall time.Duration) *receivePath {
+		r := &Receiver{}
+		path := &receivePath{}
+		t0 := time.Unix(1000, 0)
+		frame := []byte{1, bfdMultiplier, 50, 0, 0, 0, 0, 0}
+		now := t0
+		for i := 0; i < 40; i++ { // steady frames every 50 ms
+			path.touch(now)
+			r.bfdReceived(path, frame, now)
+			now = now.Add(50 * time.Millisecond)
+		}
+		now = now.Add(stall - 50*time.Millisecond)
+		path.touch(now)
+		r.bfdReceived(path, frame, now)
+		r.bfdEvaluate(path, now.Add(170*time.Millisecond))
+		return path
+	}
+	if calm := run(50 * time.Millisecond); !calm.bfdDown() {
+		t.Fatal("a calm line silent for 170 ms must be down")
+	}
+	if jittery := run(120 * time.Millisecond); jittery.bfdDown() {
+		t.Fatalf("a line that stalls for 120 ms was declared down after 170 ms (limit %v)", jittery.bfdLimit(time.Unix(1000, 0).Add(10*time.Second)))
+	}
+}
+
+// A remembered stall fades, so a line that was jittery once is not given a long detect time forever.
+func TestBFDDetectTimeFadesBackToTheFloor(t *testing.T) {
+	path := &receivePath{}
+	t0 := time.Unix(1000, 0)
+	path.touch(t0)
+	path.touch(t0.Add(400 * time.Millisecond)) // a 400 ms stall
+	if got := path.bfdLimit(t0.Add(400 * time.Millisecond)); got < 500*time.Millisecond-time.Millisecond {
+		t.Fatalf("limit right after a 400 ms stall is %v, want the 500 ms cap", got)
+	}
+	if got := path.bfdLimit(t0.Add(60 * time.Second)); got != bfdDetectMin {
+		t.Fatalf("limit a minute later is %v, want the %v floor", got, bfdDetectMin)
+	}
+}

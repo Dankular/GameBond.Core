@@ -52,9 +52,9 @@ func TestBFDStatusReportsFlapsAndCause(t *testing.T) {
 	if st["state"] != "up" || st["downs"].(uint64) != 0 {
 		t.Fatalf("%v", st)
 	}
-	r.bfdEvaluate(p, t0.Add(time.Second)) // silent for 1 s: beyond 500 ms detect time
+	r.bfdEvaluate(p, t0.Add(time.Second)) // silent for 1 s: beyond the 150 ms detect time
 	st = p.bfdStatus(t0.Add(time.Second))
-	if st["state"] != "down" || st["downs"].(uint64) != 1 || st["last_cause"] != "silence" || st["detect_ms"].(int) != 500 {
+	if st["state"] != "down" || st["downs"].(uint64) != 1 || st["last_cause"] != "silence" || st["detect_ms"].(int) != 150 {
 		t.Fatalf("%v", st)
 	}
 }

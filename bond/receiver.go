@@ -75,6 +75,8 @@ type receivePath struct {
 	endpoint                         netip.AddrPort
 	ready                            bool
 	last                             time.Time
+	gapPeak                          time.Duration // longest recent gap between frames (faded by fadedGapPeak)
+	gapPeakAt                        time.Time
 	lastSequence                     uint64
 	txEpoch, rxEpoch                 uint64
 	hasEpoch                         bool
@@ -341,7 +343,7 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 				}
 			}
 			p.ready = true
-			p.last = now
+			p.touch(now)
 			if h.Sequence > p.lastSequence {
 				p.lastSequence = h.Sequence
 			}
@@ -448,7 +450,7 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 		r.stats.PolicyDrops++
 		return out, nil
 	}
-	p.last = now
+	p.touch(now)
 	out.Authenticated = true
 	if h.Sequence > p.lastSequence {
 		p.lastSequence = h.Sequence
@@ -698,6 +700,7 @@ func (r *Receiver) Tick(now time.Time) (ReceiveResult, error) {
 			if p.parked || !p.ready || now.Sub(p.last) >= 3*time.Second || (p.policy != nil && (p.policy.Blocked || p.policy.Role == Never)) {
 				continue
 			}
+			r.bfdEvaluate(p, now) // every tick, so detection is not quantised to the BFD interval
 			if err := r.bfdSend(p, now, &out); err != nil {
 				return out, err
 			}

@@ -1,6 +1,9 @@
 package bond
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // Bidirectional forwarding detection. Every ready path exchanges a small BFD frame
 // each bfdInterval. A path is Up only while this end hears the peer within
@@ -10,8 +13,15 @@ import "time"
 // again, which damps flapping. Peers that never send BFD keep the older silence timer.
 
 const (
-	bfdInterval   = 100 * time.Millisecond
-	bfdMultiplier = 5
+	bfdInterval   = 50 * time.Millisecond
+	bfdMultiplier = 3
+	// The detect time is bfdMultiplier x bfdInterval (150 ms) on a calm line. It widens to 1.5x the
+	// longest gap the line itself produced recently (see gapPeak), up to bfdDetectMax, so a hotspot
+	// or satellite line whose frames stall for 100 ms now and then is not declared down each time.
+	bfdDetectMin = bfdMultiplier * bfdInterval
+	bfdDetectMax = 500 * time.Millisecond
+	// gapPeakHalfLife is how fast the remembered longest gap fades.
+	gapPeakHalfLife = 5 * time.Second
 	// Hold-down after a failure: short the first time, doubling for each further failure
 	// within bfdFlapWindow, so a flapping line is kept out longer but one blip is not. Every
 	// packet is also copied onto the other line, so letting a recovering line back early
@@ -53,11 +63,46 @@ func (b *bfdState) hears(now time.Time) bool {
 	return b.seen && now.Sub(b.rx) < bfdMultiplier*bfdInterval
 }
 
+// touch records an authenticated frame from the peer on the path and the gap since the previous
+// one, which is the line's own evidence of how long a healthy stall can last.
+func (p *receivePath) touch(now time.Time) {
+	if !p.last.IsZero() {
+		if gap := now.Sub(p.last); gap > 0 && gap < 2*time.Second && gap >= p.fadedGapPeak(now) {
+			p.gapPeak, p.gapPeakAt = gap, now
+		}
+	}
+	p.last = now
+}
+
+// fadedGapPeak is the remembered longest gap after fading.
+func (p *receivePath) fadedGapPeak(now time.Time) time.Duration {
+	if p.gapPeak <= 0 {
+		return 0
+	}
+	age := now.Sub(p.gapPeakAt)
+	if age <= 0 {
+		return p.gapPeak
+	}
+	return time.Duration(float64(p.gapPeak) * math.Exp2(-float64(age)/float64(gapPeakHalfLife)))
+}
+
+// bfdLimit is how long the path may be silent before it counts as not heard.
+func (p *receivePath) bfdLimit(now time.Time) time.Duration {
+	limit := p.fadedGapPeak(now) * 3 / 2
+	if limit < bfdDetectMin {
+		limit = bfdDetectMin
+	}
+	if limit > bfdDetectMax {
+		limit = bfdDetectMax
+	}
+	return limit
+}
+
 // bfdHears reports whether this end has heard the peer within the detect time. Any authenticated
-// frame from the peer on the path counts, not only a BFD frame: a loaded or lossy line can eat five
-// BFD frames in a row (or hold them in a queue behind bulk) while data, probes and feedback keep
-// arriving, and declaring that line down throws away a working path. A line that really stopped
-// delivers nothing at all, so it is still detected within the same time.
+// frame from the peer on the path counts, not only a BFD frame: a loaded or lossy line can eat
+// several BFD frames in a row (or hold them in a queue behind bulk) while data, probes and feedback
+// keep arriving, and declaring that line down throws away a working path. A line that really
+// stopped delivers nothing at all, so it is still detected within the detect time.
 func (p *receivePath) bfdHears(now time.Time) bool {
 	if !p.bfd.seen {
 		return false
@@ -66,7 +111,7 @@ func (p *receivePath) bfdHears(now time.Time) bool {
 	if p.last.After(latest) {
 		latest = p.last
 	}
-	return now.Sub(latest) < bfdMultiplier*bfdInterval
+	return now.Sub(latest) < p.bfdLimit(now)
 }
 
 // bfdReceived records a BFD frame from the peer.
@@ -157,7 +202,7 @@ func (p *receivePath) bfdStatus(now time.Time) map[string]any {
 		state = "negotiating"
 	}
 	out := map[string]any{"state": state, "downs": b.downs, "ups": b.ups, "peer_hears_us": b.peerHears,
-		"detect_ms": bfdMultiplier * int(bfdInterval/time.Millisecond)}
+		"detect_ms": int(p.bfdLimit(now) / time.Millisecond)}
 	if b.seen {
 		out["rx_age_ms"] = float64(now.Sub(b.rx)) / float64(time.Millisecond)
 	}
