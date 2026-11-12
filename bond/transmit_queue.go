@@ -83,6 +83,9 @@ func (q *TransmitQueue) popBulk() QueuedPacket {
 	q.release(p)
 	return p
 }
+// bulkClassFloor is the minimum per-class packet limit for bulk traffic.
+const bulkClassFloor = 2048
+
 func (q *TransmitQueue) Enqueue(packet QueuedPacket) bool {
 	q.syncPeer()
 	if IsTCPControl(packet.Payload) {
@@ -92,6 +95,12 @@ func (q *TransmitQueue) Enqueue(packet QueuedPacket) bool {
 	if packet.Tag > 63 || packet.ClassCapacity < 0 || packet.Expires.IsZero() || len(packet.Flow) > 512 || len(packet.Payload)+Overhead+24 > q.sender.r.mtu || len(packet.Payload) > q.byteLimit {
 		q.stats.Rejected++
 		return false
+	}
+	// Bulk traffic gets a deeper class limit than the 256-packet policy default: a TCP
+	// burst arriving at line rate faster than the paced uplink drains would otherwise be
+	// rejected, which makes the sender collapse. Delay is still bounded by CoDel and MaxAge.
+	if limit := packet.ClassCapacity; limit > 0 && !packet.Priority && !packet.Replicate && limit < bulkClassFloor {
+		packet.ClassCapacity = bulkClassFloor
 	}
 	if packet.ClassCapacity > 0 && q.classes[packet.Tag] >= packet.ClassCapacity {
 		q.stats.Rejected++

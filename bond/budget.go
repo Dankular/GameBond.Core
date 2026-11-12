@@ -471,18 +471,17 @@ func (b *Budget) reduce(now float64) {
 
 // reduceForDelay answers a standing queue that loss never signals: the
 // bottleneck buffer is full and delaying everything behind it. The rate drops
-// to just under what was actually delivered so the queue drains, at most once
+// by a tenth so the queue drains, at most once
 // per two round trips, and never below the floor. It only runs when the path is
 // really being used (not app-limited), so sparse traffic is left alone.
 func (b *Budget) reduceForDelay(now float64) {
 	if now-b.lastBackoff < math.Max(.25, 2*b.srtt) {
 		return
 	}
-	target := b.rate * .9
-	if b.deliveryRate > 0 && b.deliveryRate*.9 < target {
-		target = b.deliveryRate * .9
-	}
-	b.rate = math.Max(b.minimum, target)
+	// A fixed 10% cut, not "just under what was delivered": delivery is measured under
+	// the very throttling being applied (and on TCP it is capped by earlier drops), so
+	// following it down is a ratchet that pins the rate near whatever was last achieved.
+	b.rate = math.Max(b.minimum, b.rate*.9)
 	b.lastBackoff = now
 	b.delayBackoffs++
 	b.startup = false

@@ -88,7 +88,7 @@ func NewSession(key, session []byte, options SessionOptions) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	transmit, _ := NewTransmitQueue(sender, 1024, 4*1024*1024)
+	transmit, _ := NewTransmitQueue(sender, 4096, 8*1024*1024)
 	transmit.EnableCoDel(options.CoDel)
 	transmit.SetQoS(qos)
 	inject, _ := NewInjectionQueue(1024, 4*1024*1024)
