@@ -661,6 +661,10 @@ type PathSnapshot struct {
 
 func (s *Sender) Paths(now time.Time) []PathSnapshot {
 	var out []PathSnapshot
+	var wins uint64
+	for _, p := range s.r.paths {
+		wins += p.firstWins
+	}
 	for _, p := range s.r.paths {
 		var policy *PathPolicy
 		if p.policy != nil {
@@ -670,6 +674,15 @@ func (s *Sender) Paths(now time.Time) []PathSnapshot {
 		budget := p.budget.Stats()
 		// Kept out of Stats so the reference vectors still compare field for field.
 		budget["sack_reports"], budget["sack_lost"], budget["tail_lost"] = p.budget.sackReports, p.budget.sackLost, p.budget.tailLost
+		budget["supervision"] = p.supervisionState(now)
+		// 802.1CB latent error detection: a path that keeps delivering the second copy of
+		// nearly everything is alive but slower than its peer, an error no loss counter sees.
+		share := 0.
+		if wins >= 1000 {
+			share = float64(p.firstWins) / float64(wins)
+		}
+		budget["first_share"], budget["latent_error"] = share, wins >= 1000 && p.lateCopies >= 1000 && share < .02
+		budget["first_wins"], budget["late_copies"], budget["skew_ms"], budget["skew_max_ms"] = p.firstWins, p.lateCopies, p.skewMS, p.skewMaxMS
 		out = append(out, PathSnapshot{p.endpoint, p.ready, p.ready && now.Sub(p.last) < 3*time.Second, p.rtt * 1000, p.jitter * 1000, p.wireTX, p.wireRX, p.probeSent, p.probeAcked, p.probeLost, policy, budget, mtuStats(p), p.mtuAcks, p.mtuSkips, p.policyConfirmed, p.suspect, p.bfdStatus(now), p.local})
 	}
 	sort.Slice(out, func(i, j int) bool {

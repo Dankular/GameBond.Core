@@ -38,10 +38,14 @@ type ReorderConfig struct {
 	// holds back later packets. UDP cannot be repaired, so waiting the full TCP budget only
 	// stalls the flow; a straggler is still delivered late (AllowLate).
 	UDPTimeout time.Duration
+	// FirstArrivalUDP delivers a UDP packet the moment its first copy arrives, as PRP and HSR
+	// do, instead of holding it behind a hole. The skipped numbers are still accepted if they
+	// show up later (AllowLate).
+	FirstArrivalUDP bool
 }
 
 func DefaultReorderConfig() ReorderConfig {
-	return ReorderConfig{1024, 2048, 4 * 1024 * 1024, 30 * time.Millisecond, 120 * time.Second, true, 0}
+	return ReorderConfig{1024, 2048, 4 * 1024 * 1024, 30 * time.Millisecond, 120 * time.Second, true, 0, true}
 }
 
 type ReorderStats struct {
@@ -204,7 +208,7 @@ func (r *Reorder) Push(id, number uint64, payload []byte, now time.Time) [][]byt
 		if len(r.flows) >= r.config.MaxFlows {
 			r.remove(r.lru.Front().Value.(*orderedFlow), false)
 		}
-		f = &orderedFlow{id: id, pending: make(map[uint64]heldPacket)}
+		f = &orderedFlow{id: id, pending: make(map[uint64]heldPacket), seen: ReplayWindow{width: flowReplayWidth}}
 		f.lru = r.lru.PushBack(f)
 		r.flows[id] = f
 	}
@@ -235,7 +239,7 @@ func (r *Reorder) Push(id, number uint64, payload []byte, now time.Time) [][]byt
 		r.stats.Delivered++
 		r.advance(f, number)
 		r.drain(f, &out)
-	} else if r.config.Timeout == 0 || len(payload) > r.config.MaxBytes {
+	} else if r.config.Timeout == 0 || len(payload) > r.config.MaxBytes || (r.config.FirstArrivalUDP && ipProto(payload) == 17) {
 		for len(f.numbers) > 0 && f.numbers[0] < number {
 			r.flush(f, &out, true)
 		}

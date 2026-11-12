@@ -131,20 +131,20 @@ func BenchmarkCodecSeal(b *testing.B) {
 
 func TestReplayWindowEdgesAndForwardJumpLimit(t *testing.T) {
 	var w ReplayWindow
-	w.Accept(100000)
-	if w.Check(100000) != ReplayDuplicate {
+	w.Accept(1000000)
+	if w.Check(1000000) != ReplayDuplicate {
 		t.Fatal("highest not a duplicate")
 	}
-	if w.Check(100000-replayWidth+1) != ReplayNew || w.Check(100000-replayWidth) != ReplayTooOld {
+	if w.Check(1000000-replayWidth+1) != ReplayNew || w.Check(1000000-replayWidth) != ReplayTooOld {
 		t.Fatal("window edge")
 	}
-	if w.Check(100000+maxForwardJump) != ReplayNew || w.Check(100000+maxForwardJump+1) != ReplayTooFar {
+	if w.Check(1000000+maxForwardJump) != ReplayNew || w.Check(1000000+maxForwardJump+1) != ReplayTooFar {
 		t.Fatal("forward limit")
 	}
-	if w.Accept(100000+maxForwardJump+1) || w.Check(100000) != ReplayDuplicate {
+	if w.Accept(1000000+maxForwardJump+1) || w.Check(1000000) != ReplayDuplicate {
 		t.Fatal("a refused jump changed the window")
 	}
-	if w.Check(100001) != ReplayNew {
+	if w.Check(1000001) != ReplayNew {
 		t.Fatal("window moved after refused jump")
 	}
 }

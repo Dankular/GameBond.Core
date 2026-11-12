@@ -41,6 +41,7 @@ const (
 	ParityRS      byte = 20
 	VersionReq    byte = 21 // client -> server: payload is the client build id
 	VersionInfo   byte = 22 // server -> client: payload is the server build id
+	Supervision   byte = 23 // either way: this side's view of its own paths (IEC 62439-3 supervision)
 )
 
 var (
@@ -107,7 +108,7 @@ func (c *Codec) derive(prefix [16]byte, role string) (cipher.AEAD, error) {
 }
 
 func (c *Codec) Encode(kind byte, payload []byte) ([]byte, error) {
-	if kind < Data || kind > VersionInfo || len(payload)+Overhead > 65507 {
+	if kind < Data || kind > Supervision || len(payload)+Overhead > 65507 {
 		return nil, ErrFrame
 	}
 	var sequence uint64
@@ -136,7 +137,7 @@ func (c *Codec) Encode(kind byte, payload []byte) ([]byte, error) {
 func (c *Codec) Decode(frame []byte) (Packet, error) {
 	var result Packet
 	if len(frame) < Overhead || len(frame) > 65507 || string(frame[:4]) != "GB03" ||
-		subtle.ConstantTimeCompare(frame[4:20], c.Session[:]) != 1 || frame[36] < Data || frame[36] > VersionInfo {
+		subtle.ConstantTimeCompare(frame[4:20], c.Session[:]) != 1 || frame[36] < Data || frame[36] > Supervision {
 		return result, ErrFrame
 	}
 	copy(result.Header.Session[:], frame[4:20])

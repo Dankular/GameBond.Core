@@ -1,6 +1,14 @@
 package bond
 
-const replayWidth = 8192
+// replayWidth is the elimination (history) window in sequence numbers. 802.1CB calls this
+// the history length and IEC 62439-3 sizes the equivalent memory in time (400 ms). The
+// sequence is shared by every path and every copy, so at 1 Gbps with each packet duplicated
+// the sequence advances about 180k per second; 1<<17 keeps over 700 ms, well past the
+// 400 ms PRP forget time, and a late second copy is still recognised instead of dropped.
+const replayWidth = 1 << 17
+
+// flowReplayWidth is the per-flow packet-number window used by Reorder.
+const flowReplayWidth = 8192
 
 // maxForwardJump bounds how far one packet may move the window. The sequence is one
 // global counter shared by every path, so a jump of this size is a peer restart (which
@@ -18,12 +26,42 @@ const (
 	ReplayTooFar                         // ahead of the window by more than maxForwardJump
 )
 
-// ReplayWindow accepts unique out-of-order packets within the GB03 window.
+// ReplayWindow accepts unique out-of-order packets within the GB03 window. It is a ring
+// indexed by sequence modulo the width, so advancing costs O(distance) bit clears
+// (amortised O(1) per packet) rather than shifting the whole bitmap.
 // Its owner serializes access together with the peer's authenticated state.
 type ReplayWindow struct {
 	highest     uint64
 	initialized bool
-	bits        [replayWidth / 64]uint64
+	width       uint64 // zero means replayWidth
+	bits        []uint64
+}
+
+func (w *ReplayWindow) size() uint64 {
+	if w.width == 0 {
+		return replayWidth
+	}
+	return w.width
+}
+
+func (w *ReplayWindow) ring() {
+	if w.bits == nil {
+		w.bits = make([]uint64, w.size()/64)
+	}
+}
+
+func (w *ReplayWindow) get(sequence uint64) bool {
+	pos := sequence % w.size()
+	return w.bits[pos/64]&(uint64(1)<<(pos%64)) != 0
+}
+
+func (w *ReplayWindow) set(sequence uint64, on bool) {
+	pos := sequence % w.size()
+	if on {
+		w.bits[pos/64] |= uint64(1) << (pos % 64)
+	} else {
+		w.bits[pos/64] &^= uint64(1) << (pos % 64)
+	}
 }
 
 // Check classifies a sequence number without changing the window.
@@ -34,11 +72,10 @@ func (w *ReplayWindow) Check(sequence uint64) ReplayVerdict {
 		}
 		return ReplayNew
 	}
-	age := w.highest - sequence
-	if age >= replayWidth {
+	if w.highest-sequence >= w.size() {
 		return ReplayTooOld
 	}
-	if w.bits[age/64]&(uint64(1)<<(age%64)) != 0 {
+	if w.get(sequence) {
 		return ReplayDuplicate
 	}
 	return ReplayNew
@@ -50,43 +87,23 @@ func (w *ReplayWindow) Accept(sequence uint64) bool {
 	if w.Check(sequence) != ReplayNew {
 		return false
 	}
+	w.ring()
 	if !w.initialized {
 		w.initialized = true
 		w.highest = sequence
-		w.bits[0] = 1
+		w.set(sequence, true)
 		return true
 	}
 	if sequence > w.highest {
-		shift := sequence - w.highest
-		if shift >= replayWidth {
-			w.bits = [replayWidth / 64]uint64{}
+		if sequence-w.highest >= w.size() {
+			clear(w.bits)
 		} else {
-			words, bits := int(shift/64), uint(shift%64)
-			for i := len(w.bits) - 1; i >= 0; i-- {
-				var value uint64
-				j := i - words
-				if j >= 0 {
-					value = w.bits[j] << bits
-					if bits > 0 && j > 0 {
-						value |= w.bits[j-1] >> (64 - bits)
-					}
-				}
-				w.bits[i] = value
+			for s := w.highest + 1; s <= sequence; s++ {
+				w.set(s, false)
 			}
 		}
 		w.highest = sequence
-		w.bits[0] |= 1
-		return true
 	}
-	age := w.highest - sequence
-	if age >= replayWidth {
-		return false
-	}
-	word, bit := int(age/64), uint(age%64)
-	mask := uint64(1) << bit
-	if w.bits[word]&mask != 0 {
-		return false
-	}
-	w.bits[word] |= mask
+	w.set(sequence, true)
 	return true
 }

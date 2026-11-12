@@ -63,6 +63,8 @@ type ReceiverStats struct {
 type receivePath struct {
 	copySeen, copyMissed, copyLate   uint64
 	copyLagMS                        float64
+	firstWins, lateCopies            uint64
+	skewMS, skewMaxMS                float64
 	hasCopyLag                       bool
 	copyReported                     [3]uint64
 	lastCopyReport                   time.Time
@@ -100,6 +102,8 @@ type receivePath struct {
 	suspect                          bool
 	bfd                              bfdState
 	peerCopy                         [3]uint64
+	lastSupervision, peerSupAt       time.Time
+	peerSup                          []supervisedPath
 	// parked: the adapter is gone; never polled, never ready.
 	parked bool
 }
@@ -122,6 +126,9 @@ type Receiver struct {
 	codec                *Codec
 	handshake            *ServerHandshake
 	replay               ReplayWindow
+	firsts               [1 << 16]firstArrival
+	skewSamples          uint64
+	skewPeakMS           float64
 	dataHigh             uint64
 	dataHighAt           time.Time
 	floor                uint64
@@ -406,6 +413,8 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 		valid = len(payload) == 16
 	case CopyReport:
 		valid = len(payload) == 24
+	case Supervision:
+		valid = validSupervision(payload)
 	case VersionReq, VersionInfo:
 		valid = len(payload) <= 64
 	case Parity:
@@ -546,7 +555,9 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 		r.stats.PayloadPackets++
 		r.stats.PayloadBytes += uint64(len(payload) - 24)
 		flow, number := binary.BigEndian.Uint64(payload), binary.BigEndian.Uint64(payload[8:])
+		duplicates := r.reorder.stats.Duplicates
 		out.Deliver = r.reorder.Push(flow, number, payload[24:], now)
+		r.accountArrival(p, flow, number, r.reorder.stats.Duplicates != duplicates, now)
 		for _, hit := range r.fecData(flow, number, payload[24:], now) {
 			out.Deliver = append(out.Deliver, r.reorder.Push(hit.flow, hit.number, hit.payload, now)...)
 		}
@@ -573,6 +584,8 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 	case RepairNA:
 		r.repairUnavailable++
 		out.Unavailable = append(out.Unavailable, MissingPacket{binary.BigEndian.Uint64(payload), binary.BigEndian.Uint64(payload[8:])})
+	case Supervision:
+		p.peerSup, p.peerSupAt = parseSupervision(payload), now
 	case CopyReport:
 		p.peerCopy = [3]uint64{binary.BigEndian.Uint64(payload), binary.BigEndian.Uint64(payload[8:]), binary.BigEndian.Uint64(payload[16:])}
 	case Data, DataCopy:
@@ -723,6 +736,44 @@ func randomNonce() uint64 {
 	rand.Read(b[:])
 	return binary.BigEndian.Uint64(b[:])
 }
+// firstArrival remembers when a packet was first delivered, so the later copy on another
+// path can be timed against it (the PRP/802.1CB per-LAN accounting).
+type firstArrival struct {
+	key uint64
+	at  time.Time
+}
+
+// accountArrival records which path delivered a packet first and, for the redundant copy,
+// how long after the winner it arrived: the skew between the paths.
+func (r *Receiver) accountArrival(p *receivePath, flow, number uint64, duplicate bool, now time.Time) {
+	key := (flow*0x9E3779B97F4A7C15 ^ number) * 0x9E3779B97F4A7C15
+	if key == 0 {
+		key = 1
+	}
+	slot := &r.firsts[key>>48]
+	if !duplicate {
+		p.firstWins++
+		*slot = firstArrival{key, now}
+		return
+	}
+	p.lateCopies++
+	if slot.key != key {
+		return
+	}
+	ms := float64(now.Sub(slot.at)) / float64(time.Millisecond)
+	if ms < 0 {
+		return
+	}
+	if p.skewMS == 0 {
+		p.skewMS = ms
+	} else {
+		p.skewMS = .9*p.skewMS + .1*ms
+	}
+	p.skewMaxMS = math.Max(p.skewMaxMS*.999, ms)
+	r.skewSamples++
+	r.skewPeakMS = math.Max(r.skewPeakMS*.999, ms)
+}
+
 // reorderCeiling bounds how long (seconds, before scaling) one hole may hold back a flow.
 // With every packet duplicated on a second path, the copy lands within the path skew, so
 // a hole older than this is a real loss and waiting longer only builds a burst behind it.
@@ -743,6 +794,11 @@ func (r *Receiver) updateReorderBudget() {
 	scale := math.Max(1, r.reorderScale)
 	if count >= 2 {
 		timeout = math.Min(reorderCeiling*scale, scale*math.Max(timeout, math.Max((maximum-minimum)/2, maximum/2)+4*jitter+timeout))
+	}
+	// The copy lands within the measured skew of the first: waiting much longer for a hole
+	// to fill only adds latency. Applies once enough duplicates have been timed.
+	if r.skewSamples >= 200 {
+		timeout = math.Min(timeout, math.Max(r.reorderBase.Seconds(), 2*r.skewPeakMS/1000+4*jitter))
 	}
 	r.reorder.config.Timeout = time.Duration(timeout * float64(time.Second))
 	udp := timeout
@@ -886,7 +942,7 @@ func (r *Receiver) resolveCopies(now time.Time, out *ReceiveResult) error {
 		}
 		p.copyReported, p.lastCopyReport = counters, now
 	}
-	return nil
+	return r.supervise(now, out)
 }
 
 // tuneReorder reviews the reorder wait every few seconds. TCP packets that keep
