@@ -127,6 +127,7 @@ type Conn struct {
 	// RTT
 	srtt, rttvar, minRTT time.Duration
 	minNext              time.Duration
+	flightBytes          int // bytes sent and neither acknowledged, dropped nor declared lost
 	minAt                time.Time
 	hasRTT               bool
 
@@ -279,14 +280,17 @@ func (c *Conn) rto() time.Duration {
 func (c *Conn) SRTT() time.Duration { return c.srtt }
 
 // InFlight is the bytes sent and not yet acknowledged or declared lost.
-func (c *Conn) InFlight() int {
-	n := 0
-	for _, p := range c.inflight {
-		if !p.lost {
-			n += int(p.end - p.off)
-		}
+func (c *Conn) InFlight() int { return c.flightBytes }
+
+// untrack removes a packet from the in-flight set, keeping the byte count right.
+func (c *Conn) untrack(p *sentPacket) {
+	if c.inflight[p.pn] == nil {
+		return
 	}
-	return n
+	delete(c.inflight, p.pn)
+	if !p.lost {
+		c.flightBytes -= int(p.end - p.off)
+	}
 }
 
 // ---------------------------------------------------------------- receive
@@ -471,16 +475,20 @@ func (c *Conn) onAck(b []byte, now time.Time) ([]byte, error) {
 	newly := false
 	var sample time.Duration
 	var got []*sentPacket
+	// Packet numbers below the oldest one still tracked were acknowledged long
+	// ago, yet the receiver's first range reaches back to the start of the
+	// connection: walking it would make every ACK cost the whole history.
+	floor := c.nextPN
+	if len(c.order) > 0 {
+		floor = c.order[0]
+	}
 	for _, r := range ranges {
-		for pn := r.lo; pn <= r.hi; pn++ {
+		for pn := max(r.lo, floor); pn <= r.hi; pn++ {
 			p := c.inflight[pn]
 			if p == nil {
-				if pn == r.lo && r.hi-r.lo > 1<<16 {
-					break
-				}
 				continue
 			}
-			delete(c.inflight, pn)
+			c.untrack(p)
 			got = append(got, p)
 			newly = true
 			if pn == largest || !c.hasAck || pn > c.largestAck {
@@ -600,10 +608,17 @@ func (c *Conn) advanceBase(to uint64) {
 		}
 	}
 	c.acked = c.acked[:j]
-	for pn, p := range c.inflight {
-		if p.end <= to && !p.fin {
-			delete(c.inflight, pn)
+	// Entries wholly below the new base are done; they sit at the head of the
+	// send order, so only that head is walked rather than every packet in flight.
+	for _, pn := range c.order {
+		p := c.inflight[pn]
+		if p == nil {
+			continue
 		}
+		if p.end > to || p.fin {
+			break
+		}
+		c.untrack(p)
 	}
 }
 
@@ -669,6 +684,9 @@ func (c *Conn) detectLoss(now time.Time) {
 }
 
 func (c *Conn) markLost(p *sentPacket) {
+	if !p.lost {
+		c.flightBytes -= int(p.end - p.off)
+	}
 	p.lost = true
 	if p.pn >= c.recoveryPN { // one reduction per round trip of losses
 		c.cwnd = max(c.cwnd*85/100, 4*c.cfg.MSS)
@@ -857,7 +875,7 @@ func (c *Conn) Poll(now time.Time, out *[][]byte) time.Time {
 }
 
 func (c *Conn) unsend(p *sentPacket) {
-	delete(c.inflight, p.pn)
+	c.untrack(p)
 	c.order = c.order[:len(c.order)-1]
 	c.nextPN--
 }
@@ -871,6 +889,7 @@ func (c *Conn) dataPacket(ch chunk, now time.Time) ([]byte, *sentPacket) {
 	c.nextPN++
 	p := &sentPacket{pn: pn, off: ch.off, end: ch.end, fin: ch.fin, at: now}
 	c.inflight[pn] = p
+	c.flightBytes += int(p.end - p.off)
 	c.order = append(c.order, pn)
 	flags := byte(flagData)
 	if ch.fin {

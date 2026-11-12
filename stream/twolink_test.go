@@ -159,3 +159,15 @@ func TestTwoLinkSingleStreamRough(t *testing.T) {
 	hotspot := model{rate: 25e6 / 8, base: 27 * time.Millisecond, jitter: 8 * time.Millisecond, maxQ: 60 * time.Millisecond, loss: .005}
 	t.Logf("rough: single stream, full duplication: %.1f Mbit/s", twoLinkDownload(t, 12, starlink, hotspot, Config{}))
 }
+
+func TestTwoLinkFast(t *testing.T) {
+	a := model{rate: 200e6 / 8, base: 25 * time.Millisecond, jitter: 4 * time.Millisecond, maxQ: 250 * time.Millisecond}
+	b := model{rate: 200e6 / 8, base: 25 * time.Millisecond, jitter: 4 * time.Millisecond, maxQ: 250 * time.Millisecond}
+	t.Logf("fast links 200/200: %.1f Mbit/s", twoLinkDownload(t, 12, a, b, Config{}))
+}
+
+func TestTwoLinkFastNoJitter(t *testing.T) {
+	a := model{rate: 200e6 / 8, base: 25 * time.Millisecond, maxQ: 250 * time.Millisecond}
+	b := model{rate: 200e6 / 8, base: 25 * time.Millisecond, maxQ: 250 * time.Millisecond}
+	t.Logf("no jitter 200/200: %.1f Mbit/s", twoLinkDownload(t, 12, a, b, Config{}))
+}
