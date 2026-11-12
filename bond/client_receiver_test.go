@@ -19,6 +19,8 @@ type clientServerPair struct {
 	src    [2]netip.AddrPort
 	drop   [2]bool // blackhole uplink i in both directions
 	limit  [2]int  // when non-zero, uplink i silently drops frames larger than this
+	// lose, when set, sees every frame about to be delivered and drops it by returning true.
+	lose func(fromClient bool, local int, kind byte) bool
 }
 
 func newClientServerPair(t *testing.T) *clientServerPair {
@@ -59,7 +61,7 @@ func (p *clientServerPair) deliver(fromClient bool, out ReceiveResult) {
 		var res ReceiveResult
 		var err error
 		if it.fromClient {
-			if p.drop[it.d.Local] || (p.limit[it.d.Local] > 0 && len(it.d.Frame) > p.limit[it.d.Local]) {
+			if p.drop[it.d.Local] || (p.limit[it.d.Local] > 0 && len(it.d.Frame) > p.limit[it.d.Local]) || (p.lose != nil && p.lose(true, it.d.Local, it.d.Frame[36])) {
 				continue
 			}
 			res, err = p.server.ReceiveOn(0, it.d.Frame, p.src[it.d.Local], p.now)
@@ -73,7 +75,7 @@ func (p *clientServerPair) deliver(fromClient bool, out ReceiveResult) {
 					local = i
 				}
 			}
-			if local < 0 || p.drop[local] || (p.limit[local] > 0 && len(it.d.Frame) > p.limit[local]) {
+			if local < 0 || p.drop[local] || (p.limit[local] > 0 && len(it.d.Frame) > p.limit[local]) || (p.lose != nil && p.lose(false, local, it.d.Frame[36])) {
 				continue
 			}
 			res, err = p.client.ReceiveOn(local, it.d.Frame, p.srv, p.now)

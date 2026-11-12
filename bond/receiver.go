@@ -50,6 +50,8 @@ type ReceiverStats struct {
 	PayloadPackets, PayloadBytes, WireRX, WireTX, SendErrors                                  uint64
 	ReplayTooOld, ReplayTooFar                                                                uint64
 	PeerRestarts, PathMigrations                                                              uint64
+	// GapFeedback counts feedback frames sent at once because a frame arrived ahead of a missing one.
+	GapFeedback uint64
 	// Data frames (replicated game traffic) are delivered at first arrival, so a
 	// frame with a lower sequence than one already delivered arrives out of order.
 	DataReordered, DataReorderedOver5ms, DataReorderedOver20ms uint64
@@ -103,6 +105,8 @@ type receivePath struct {
 	bfd                              bfdState
 	peerCopy                         [3]uint64
 	lastSupervision, peerSupAt       time.Time
+	supNext                          time.Time
+	supSig                           uint64
 	peerSup                          []supervisedPath
 	// parked: the adapter is gone; never polled, never ready.
 	parked bool
@@ -546,6 +550,10 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 			p.sack = sackWindow{}
 		}
 		if p.rxEpoch == epoch {
+			// A later frame arrived ahead of a missing one: report it now rather than at the next
+			// timer, since the sender cannot start repairing until it hears. Rate limited, because
+			// a striped flow sees the other path's frames as gaps too.
+			gap := p.sack.seen && h.Sequence > p.sack.high+1 && h.Sequence-p.sack.high < sackBits
 			p.sack.Note(h.Sequence)
 			p.stripeBytes += uint64(len(frame))
 			if p.stripeAt.IsZero() || h.Sequence > p.stripeHighest {
@@ -553,6 +561,12 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 				p.stripeAt = now
 			}
 			p.feedbackDue = true
+			if gap && p.feedbackAllowed(now) && (p.lastFeedback.IsZero() || now.Sub(p.lastFeedback) >= gapFeedbackGap) {
+				if ferr := r.sendFeedback(p, now, &out); ferr != nil {
+					return out, ferr
+				}
+				r.stats.GapFeedback++
+			}
 		}
 		r.stats.PayloadPackets++
 		r.stats.PayloadBytes += uint64(len(payload) - 24)
@@ -615,6 +629,46 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 	}
 	return out, err
 }
+// gapFeedbackGap is the least time between feedback frames sent because of a gap. The regular
+// path sends at most every 20 ms; a gap may send sooner, but a striped flow sees the other path's
+// frames as gaps, so it is bounded to 100 frames a second per path.
+const gapFeedbackGap = 10 * time.Millisecond
+
+// feedbackAllowed reports whether feedback may be sent on p at all.
+func (p *receivePath) feedbackAllowed(now time.Time) bool {
+	if p.policy != nil && (p.policy.Blocked || p.policy.Role == Never) {
+		return false
+	}
+	return p.ready && !p.stripeAt.IsZero() && now.Sub(p.last) < 3*time.Second
+}
+
+// sendFeedback queues one feedback frame for p. The frame carries a bitmap of the sequences
+// received on this path, so the peer learns exactly which frames were lost instead of waiting
+// out a timer.
+func (r *Receiver) sendFeedback(p *receivePath, now time.Time, out *ReceiveResult) error {
+	payload := make([]byte, feedbackSackSize)
+	binary.BigEndian.PutUint64(payload, p.rxEpoch)
+	binary.BigEndian.PutUint64(payload[8:], p.stripeHighest)
+	binary.BigEndian.PutUint64(payload[16:], p.stripeBytes)
+	hold := now.Sub(p.stripeAt) / time.Microsecond
+	if hold < 0 {
+		hold = 0
+	}
+	if hold > 1000000 {
+		hold = 1000000
+	}
+	binary.BigEndian.PutUint32(payload[24:], uint32(hold))
+	base, bits := p.sack.Report()
+	binary.BigEndian.PutUint64(payload[28:], base)
+	copy(payload[36:], bits)
+	if err := r.write(Feedback, payload, p.local, p.endpoint, out); err != nil {
+		return err
+	}
+	p.feedbackDue = false
+	p.lastFeedback = now
+	return nil
+}
+
 func (r *Receiver) Tick(now time.Time) (ReceiveResult, error) {
 	r.tuneReorder(now)
 	out := ReceiveResult{Deliver: r.reorder.Poll(now)}
@@ -625,10 +679,7 @@ func (r *Receiver) Tick(now time.Time) (ReceiveResult, error) {
 		return out, err
 	}
 	for _, p := range r.paths {
-		if p.policy != nil && (p.policy.Blocked || p.policy.Role == Never) {
-			continue
-		}
-		if !p.ready || p.stripeAt.IsZero() || now.Sub(p.last) >= 3*time.Second {
+		if !p.feedbackAllowed(now) {
 			continue
 		}
 		interval := 100 * time.Millisecond
@@ -638,28 +689,9 @@ func (r *Receiver) Tick(now time.Time) (ReceiveResult, error) {
 		if !p.lastFeedback.IsZero() && now.Sub(p.lastFeedback) < interval {
 			continue
 		}
-		// The frame carries a bitmap of the sequences received on this path, so the peer
-		// learns exactly which frames were lost instead of waiting out a timer.
-		payload := make([]byte, feedbackSackSize)
-		binary.BigEndian.PutUint64(payload, p.rxEpoch)
-		binary.BigEndian.PutUint64(payload[8:], p.stripeHighest)
-		binary.BigEndian.PutUint64(payload[16:], p.stripeBytes)
-		hold := now.Sub(p.stripeAt) / time.Microsecond
-		if hold < 0 {
-			hold = 0
-		}
-		if hold > 1000000 {
-			hold = 1000000
-		}
-		binary.BigEndian.PutUint32(payload[24:], uint32(hold))
-		base, bits := p.sack.Report()
-		binary.BigEndian.PutUint64(payload[28:], base)
-		copy(payload[36:], bits)
-		if err := r.write(Feedback, payload, p.local, p.endpoint, &out); err != nil {
+		if err := r.sendFeedback(p, now, &out); err != nil {
 			return out, err
 		}
-		p.feedbackDue = false
-		p.lastFeedback = now
 	}
 	if r.probeInterval > 0 {
 		for _, p := range r.paths {
