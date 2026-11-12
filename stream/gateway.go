@@ -89,7 +89,7 @@ func (g *Gateway) handle(s *Stream, dial func(string, string, time.Duration) (ne
 			if st.PacketsSent == 0 && st.BytesAcked == 0 {
 				continue
 			}
-			fmt.Printf("{\"status\":\"stream\",\"cwnd\":%d,\"srtt_ms\":%d,\"retx\":%d,\"spurious\":%d,\"acked\":%d}\n", cwnd, rtt.Milliseconds(), st.Retransmits, st.SpuriousRetx, st.BytesAcked)
+			fmt.Printf("{\"status\":\"stream\",\"cwnd\":%d,\"inflight\":%d,\"srtt_ms\":%d,\"retx\":%d,\"spurious\":%d,\"timeouts\":%d,\"drop_window\":%d,\"drop_ooo\":%d,\"acked\":%d}\n", cwnd, st.InFlight, rtt.Milliseconds(), st.Retransmits, st.SpuriousRetx, st.Timeouts, st.DropWindow, st.DropOOO, st.BytesAcked)
 			if s.closedNow() {
 				return
 			}

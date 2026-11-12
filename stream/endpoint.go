@@ -392,7 +392,9 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 func (s *Stream) Stats() (Stats, int, time.Duration) {
 	s.ep.mu.Lock()
 	defer s.ep.mu.Unlock()
-	return s.c.Stats, s.c.Cwnd(), s.c.SRTT()
+	st := s.c.Stats
+	st.InFlight = s.c.InFlight()
+	return st, s.c.Cwnd(), s.c.SRTT()
 }
 
 func (s *Stream) closedNow() bool {

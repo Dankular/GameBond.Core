@@ -156,6 +156,7 @@ type Stats struct {
 	PacketsSent, PacketsRecv, Retransmits, SpuriousRetx uint64
 	BytesAcked, BytesDelivered                          uint64
 	Timeouts                                            uint64
+	InFlight                                            int    // bytes in flight when sampled (set by Stream.Stats)
 	DropWindow, DropOOO                                 uint64
 	DroppedData                                         uint64 // data packets discarded without being stored (not acknowledged)
 }
