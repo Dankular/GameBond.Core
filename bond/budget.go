@@ -36,6 +36,11 @@ type budgetPending struct {
 // corroborated test, so growth only pauses once loss is clearly heavy.
 const growthLossCeiling = .05
 
+// assertiveDelayFloor is the queueing delay (seconds over the baseline) an assertive
+// path tolerates before it counts as a standing queue. A loaded LEO link sits at
+// 20-40 ms by itself, so 10 ms made every busy second look like congestion.
+const assertiveDelayFloor = .040
+
 // BaseRTTWindow is the seconds per bucket of the decaying delay baseline.
 const BaseRTTWindow = 10.0
 
@@ -436,7 +441,7 @@ func (b *Budget) Acknowledge(sequence, delivered uint64, now float64, delayUS ui
 	}
 	delayFloor, delayVar, busy := .025, 4.0, !b.appLimited
 	if b.delayAssertive {
-		delayFloor, delayVar, busy = .010, 2.5, utilization >= .5
+		delayFloor, delayVar, busy = assertiveDelayFloor, 2.5, utilization >= .5
 	}
 	if busy && math.Max(0, b.srtt-base) > math.Max(delayFloor, math.Max(base*.5, delayVar*b.rttVar)) {
 		if b.delaySamples < 3 {
@@ -550,7 +555,14 @@ func (b *Budget) measure(now float64) {
 	} else if b.delayControl && b.delaySamples >= 3 && (!b.appLimited || (b.delayAssertive && utilization >= .5)) {
 		b.reduceForDelay(now)
 	}
-	if !b.growthAppLimited && b.delaySamples == 0 && !corroborated && b.lossRatio < growthLossCeiling && pressure < .25 && allowance > 0 && b.epochDelivered >= 6000 && b.epochRetired >= 6000 && b.epochDelivered >= allowance*.65 && now-b.lastBackoff >= math.Max(.25, b.rawSRTT) {
+	// A path that mostly carries redundancy copies charges them as unpaced wire, which
+	// leaves no allowance for window data, so the usual gate never opens and the path
+	// stays at its starting rate while the copies fill it. If the wire is full and nearly
+	// all of it is being delivered, the path can take more.
+	wire := b.epochBulkWire + b.epochUnpacedWire
+	copyFull := wire >= b.rate*elapsed*.8 && b.epochDelivered >= wire*.65
+	grow := (!b.growthAppLimited && allowance > 0 && b.epochDelivered >= allowance*.65) || copyFull
+	if grow && b.delaySamples == 0 && !corroborated && b.lossRatio < growthLossCeiling && pressure < .25 && b.epochDelivered >= 6000 && b.epochRetired >= 6000 && now-b.lastBackoff >= math.Max(.25, b.rawSRTT) {
 		increment := 12500.
 		if b.startup {
 			increment = math.Max(12500, math.Min(b.rate*.5, 1250000))

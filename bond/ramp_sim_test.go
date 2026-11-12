@@ -67,3 +67,39 @@ func TestBudgetRampsOnAJitteryLossyLink(t *testing.T) {
 		}
 	}
 }
+
+// A path whose traffic is all redundancy copies (always-duplicate: the sibling path
+// carries the window data) must still grow when the wire is full and delivered.
+func TestCopyOnlyPathGrows(t *testing.T) {
+	b, _ := NewBudget(10, 300)
+	b.UseLiveLimits()
+	b.delayControl, b.delayAssertive = true, true
+	const size = 1400
+	capBytes := 100.0 * 125000
+	var linkFree float64
+	var seq, delivered uint64
+	var acks simAcks
+	for ms := 0; ms < 30000; ms++ {
+		now := float64(ms) / 1000
+		for len(acks) > 0 && acks[0].at <= now {
+			a := heap.Pop(&acks).(simAck)
+			b.Acknowledge(a.seq, a.delivered, a.at, 0)
+		}
+		b.Expire(now)
+		for n := 0; n < 2000 && now >= b.next-.001; n++ {
+			seq++
+			b.SentCopy(seq, size, now)
+			start := max(now, linkFree)
+			if start-now > .1 {
+				continue
+			}
+			linkFree = start + size/capBytes
+			delivered += size
+			heap.Push(&acks, simAck{linkFree + .05, seq, delivered})
+		}
+	}
+	if b.RateMbps() < 40 {
+		t.Fatalf("copy-only path stayed at %.1f Mbps (increases %d)", b.RateMbps(), b.increases)
+	}
+	t.Logf("copy-only path rate %.0f Mbps, increases %d", b.RateMbps(), b.increases)
+}
