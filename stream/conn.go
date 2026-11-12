@@ -34,7 +34,7 @@ const (
 	maxAckRanges   = 200
 	dataAckRanges  = 16
 	bareAckRanges  = 100
-	maxOOOBytes    = 1 << 20
+	maxOOOBytes    = 4 << 20
 )
 
 // Errors reported by Conn.
@@ -63,10 +63,10 @@ func (c *Config) defaults() {
 		c.MSS = 1000
 	}
 	if c.SendBuffer == 0 {
-		c.SendBuffer = 1 << 20
+		c.SendBuffer = 4 << 20
 	}
 	if c.RecvWindow == 0 {
-		c.RecvWindow = 1 << 20
+		c.RecvWindow = 4 << 20
 	}
 	if c.MinReorder == 0 {
 		c.MinReorder = 5 * time.Millisecond
@@ -126,6 +126,8 @@ type Conn struct {
 
 	// RTT
 	srtt, rttvar, minRTT time.Duration
+	minNext              time.Duration
+	minAt                time.Time
 	hasRTT               bool
 
 	// Receive side.
@@ -515,8 +517,10 @@ func (c *Conn) grow(acked int) {
 	// A standing queue in the transport (RTT well above the floor, beyond what
 	// the slower link explains) means the window is past the path's capacity:
 	// shrink it gently rather than wait for the queue to overflow into loss.
-	if c.hasRTT && c.srtt > c.minRTT+c.reorderWindow()+30*time.Millisecond {
-		c.cwnd = max(c.cwnd-acked/8, 8*c.cfg.MSS)
+	// Only a sustained, large inflation counts (twice the recent floor): a fast
+	// link's jitter and the other path's ordinary delay must not pin the window.
+	if c.hasRTT && c.srtt > 2*c.minRTT+c.reorderWindow()+30*time.Millisecond {
+		c.cwnd = max(c.cwnd-acked/16, 32*c.cfg.MSS)
 		c.ssthresh = min(c.ssthresh, c.cwnd)
 		return
 	}
@@ -535,8 +539,18 @@ func (c *Conn) rttSample(s time.Duration) {
 		c.srtt, c.rttvar, c.minRTT, c.hasRTT = s, s/2, s, true
 		return
 	}
+	// minRTT is the floor over roughly the last 10-20 s, so a route change that
+	// raises the base delay is not mistaken for a standing queue forever.
 	if s < c.minRTT {
 		c.minRTT = s
+	}
+	if c.minAt.IsZero() {
+		c.minAt = time.Now()
+	} else if time.Since(c.minAt) > 10*time.Second {
+		c.minRTT, c.minAt = max(c.minNext, s), time.Now()
+		c.minNext = s
+	} else if c.minNext == 0 || s < c.minNext {
+		c.minNext = s
 	}
 	d := c.srtt - s
 	if d < 0 {
