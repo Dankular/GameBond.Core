@@ -120,7 +120,9 @@ func (c *Codec) Encode(kind byte, payload []byte) ([]byte, error) {
 			break
 		}
 	}
-	header := make([]byte, HeaderSize)
+	// Capacity for the sealed frame up front: Seal appends to the header, and a short
+	// slice would reallocate and copy the whole frame once per packet.
+	header := make([]byte, HeaderSize, HeaderSize+len(payload)+c.tx.Overhead())
 	copy(header, []byte("GB03"))
 	copy(header[4:20], c.Session[:])
 	copy(header[20:36], c.Prefix[:])

@@ -723,6 +723,11 @@ func randomNonce() uint64 {
 	rand.Read(b[:])
 	return binary.BigEndian.Uint64(b[:])
 }
+// reorderCeiling bounds how long (seconds, before scaling) one hole may hold back a flow.
+// With every packet duplicated on a second path, the copy lands within the path skew, so
+// a hole older than this is a real loss and waiting longer only builds a burst behind it.
+const reorderCeiling = .1
+
 func (r *Receiver) updateReorderBudget() {
 	count := 0
 	minimum, maximum, jitter := math.Inf(1), 0., 0.
@@ -737,7 +742,7 @@ func (r *Receiver) updateReorderBudget() {
 	timeout := r.reorderBase.Seconds()
 	scale := math.Max(1, r.reorderScale)
 	if count >= 2 {
-		timeout = math.Min(.2*scale, scale*math.Max(timeout, math.Max((maximum-minimum)/2, maximum/2)+4*jitter+timeout))
+		timeout = math.Min(reorderCeiling*scale, scale*math.Max(timeout, math.Max((maximum-minimum)/2, maximum/2)+4*jitter+timeout))
 	}
 	r.reorder.config.Timeout = time.Duration(timeout * float64(time.Second))
 	udp := timeout

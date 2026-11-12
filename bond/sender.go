@@ -48,6 +48,9 @@ type SenderStats struct {
 // Sender is the actor-owned transmit half. A caller retries a pending bulk
 // packet at the returned time, servicing Receive/Tick/urgent queues meanwhile.
 type Sender struct {
+	// Scratch space reused by Bulk on every packet (the sender runs on one goroutine).
+	availScratch []*receivePath
+	bodyScratch  []byte
 	r                 *Receiver
 	flows             map[string]*sendFlow
 	parityOpen        map[*sendFlow]struct{} // flows holding a partly filled parity group
@@ -534,7 +537,7 @@ func (s *Sender) Bulk(payload []byte, key string, now time.Time, writer Datagram
 	}
 	paths = selected
 	earliest := math.Inf(1)
-	var available []*receivePath
+	available := s.availScratch[:0]
 	for _, p := range paths {
 		earliest = math.Min(earliest, ready[p])
 		if ready[p] <= timestamp+.000001 {
@@ -593,8 +596,12 @@ func (s *Sender) Bulk(payload []byte, key string, now time.Time, writer Datagram
 		}
 		available = reordered
 	}
+	s.availScratch = available
 	for _, p := range available {
-		body := make([]byte, 24+len(payload))
+		if cap(s.bodyScratch) < 24+len(payload) {
+			s.bodyScratch = make([]byte, 24+len(payload))
+		}
+		body := s.bodyScratch[:24+len(payload)] // sealed into a new frame: not retained
 		binary.BigEndian.PutUint64(body, f.id)
 		binary.BigEndian.PutUint64(body[8:], f.number)
 		binary.BigEndian.PutUint64(body[16:], p.txEpoch)

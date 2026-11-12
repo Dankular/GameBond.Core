@@ -15,6 +15,8 @@ const (
 	maxWindow   = 1 << 20
 	livePending = 16384
 	liveWindow  = 8 << 20
+	refCredit   = .002
+	liveCredit  = .001
 )
 
 type budgetPending struct {
@@ -84,6 +86,11 @@ type Budget struct {
 	// reaches, so bulk sat in the bottleneck buffer and delayed game packets.
 	delayAssertive bool
 	startupExit    string
+	// credit is how far behind the clock the pacer may fall and still release the
+	// shortfall at once. It is the largest burst a late wakeup can produce, in seconds
+	// of wire time. The reference value (2 ms) tolerates a coarse OS timer; a live path
+	// polls while it has a backlog, so it can afford 1 ms.
+	credit float64
 	// pendingCap and windowCap are the tracked-packet and in-flight limits.
 	pendingCap int
 	windowCap  float64
@@ -92,7 +99,9 @@ type Budget struct {
 }
 
 // UseLiveLimits gives the budget the larger production window and tracking limits.
-func (b *Budget) UseLiveLimits() { b.pendingCap, b.windowCap = livePending, liveWindow }
+func (b *Budget) UseLiveLimits() {
+	b.pendingCap, b.windowCap, b.credit = livePending, liveWindow, liveCredit
+}
 
 func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 func NewBudget(initial, maximum float64) (*Budget, error) {
@@ -100,7 +109,7 @@ func NewBudget(initial, maximum float64) (*Budget, error) {
 		return nil, errors.New("invalid path rates")
 	}
 	return &Budget{initial: initial, maximum: maximum, rate: initial * 125000, minimum: math.Min(initial, .05) * 125000,
-		srtt: .25, rawSRTT: .25, rtoBackoff: 1, pending: make(map[uint64]*list.Element), lastBackoff: math.Inf(-1), pendingCap: maxPending, windowCap: maxWindow,
+		credit: refCredit, srtt: .25, rawSRTT: .25, rtoBackoff: 1, pending: make(map[uint64]*list.Element), lastBackoff: math.Inf(-1), pendingCap: maxPending, windowCap: maxWindow,
 		growthAppLimited: true, appLimited: true, startup: true}, nil
 }
 func validTime(now float64) bool   { return finite(now) && now >= 0 }
@@ -218,7 +227,7 @@ func (b *Budget) Sent(sequence uint64, size int, now float64) (bool, error) {
 	b.epochSent += float64(size)
 	b.epochBulkWire += float64(size + 28)
 	b.observed = math.Max(b.observed, now)
-	b.next = math.Max(now-.002, b.next) + float64(size+28)/b.rate
+	b.next = math.Max(now-b.credit, b.next) + float64(size+28)/b.rate
 	if len(b.pending) >= b.pendingCap {
 		b.untracked++
 		return false, nil
