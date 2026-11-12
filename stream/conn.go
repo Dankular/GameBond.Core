@@ -155,6 +155,7 @@ type Stats struct {
 	PacketsSent, PacketsRecv, Retransmits, SpuriousRetx uint64
 	BytesAcked, BytesDelivered                          uint64
 	Timeouts                                            uint64
+	DropWindow, DropOOO                                 uint64
 	DroppedData                                         uint64 // data packets discarded without being stored (not acknowledged)
 }
 
@@ -365,6 +366,7 @@ func (c *Conn) notePN(pn uint64) {
 func (c *Conn) onData(off uint64, p []byte, fin bool, now time.Time) bool {
 	end := off + uint64(len(p))
 	if len(p) > 0 && end > c.rcvNxt && off > c.rcvNxt && end > c.rcvNxt+c.recvWindow()+uint64(len(c.readBuf)) {
+		c.Stats.DropWindow++
 		return false // outside the window we advertised
 	}
 	if fin {
@@ -389,6 +391,7 @@ func (c *Conn) onData(off uint64, p []byte, fin bool, now time.Time) bool {
 			return true // already held
 		}
 		if c.oooBytes+len(p)-len(old) > maxOOOBytes {
+			c.Stats.DropOOO++
 			return false
 		}
 		c.oooBytes += len(p) - len(old) // a longer copy of the same start replaces the shorter one
@@ -396,6 +399,7 @@ func (c *Conn) onData(off uint64, p []byte, fin bool, now time.Time) bool {
 		return true
 	}
 	if c.oooBytes+len(p) > maxOOOBytes {
+		c.Stats.DropOOO++
 		return false
 	}
 	c.oooData[off] = append([]byte(nil), p...)
