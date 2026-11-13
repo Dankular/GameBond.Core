@@ -48,15 +48,18 @@ Each link is a UDP path to the server; the receiver reassembles one IPv4 packet 
 - Path hints (`SetPathHint`) let the client mark a local link degraded for a period.
 
 **Failure detection**
-- BFD: a frame per path every 100 ms. A path is up only while this end hears the peer and the peer reports
-  hearing us, so one-way failures are caught at both ends. The hold-down after a failure grows from 250 ms
-  to 4 s while a link flaps (30 s window).
+- BFD: a frame per path every 50 ms. A path is up only while this end hears the peer and the peer reports
+  hearing us, so one-way failures are caught at both ends. Any authenticated frame counts as hearing the
+  peer, so lost BFD frames do not down a line that still delivers. A calm line is declared down after 150 ms;
+  the limit widens to 1.5 times the longest gap the line itself produced recently (at most 500 ms) and falls
+  back with a 5 s half-life. The hold-down after a failure grows from 250 ms to 4 s while a link flaps (30 s window).
 - Probes and pongs give RTT and jitter per path. Passive ack-stall detection flags a busy path that hears
   nothing back, with no probe needed.
 - Failover replay (`EnableFailover`): packets a path carried just before it went quiet are replayed on the
   best live path with their original sequence, so first arrival wins.
-- Supervision frames (IEC 62439-3 style): each side periodically reports its view of its own paths, and a
-  silent peer is aged out at 2.5 times the interval. This exposes asymmetric failures.
+- Supervision frames (IEC 62439-3 style): each side reports its view of its own paths on a fixed cadence,
+  announces a state change within 100 ms, and retries every 250 ms while the peer's announcement is overdue.
+  A silent peer is aged out at 2.5 times the interval. This exposes asymmetric failures.
 - Outage journal: timestamped record of every line transition and every full outage, with cause. It is
   bounded in memory and has a durable log.
 - Health alarms for silent failures such as rejected feedback.
@@ -64,7 +67,8 @@ Each link is a UDP path to the server; the receiver reassembles one IPv4 packet 
 
 **Loss recovery**
 - First-arrival elimination with a replay window of 131,072 sequence numbers shared by all paths and copies.
-- Selective acknowledgement: receiver feedback carries a bitmap of recently received frames. The sender
+- Selective acknowledgement: receiver feedback carries a bitmap of recently received frames, and the receiver
+  sends it at once when a frame reveals a gap (at most one per 10 ms per path) instead of waiting for its timer. The sender
   declares a frame lost when later frames arrived without it and resends at once on the other path, unless a
   sibling copy is still unaccounted for.
 - Tail probing: frames unacknowledged for about one round trip are resent, which protects the end of a burst.
@@ -145,3 +149,107 @@ formats or the RCT trailer.
 
 `go test ./...` runs the suites. `stream` includes a two-link model (`twolink_test.go`) with latency, jitter
 and loss. `bond` includes behaviour vectors generated from the original Python implementation.
+
+## Changelog
+
+Newest first. Versions are git tags; each entry was written from the diff between the tag and the one before it.
+Add an entry under **Unreleased** with every change that alters behaviour, and move it under a version when the
+tag is cut. Dates are the commit dates in git (UTC).
+
+### Unreleased
+- **BFD detects a dead line in 150 ms, down from 500 ms.** Interval 100 ms to 50 ms and multiplier 5 to 3. The
+  limit widens to 1.5 times the longest inter-frame gap the line produced recently (cap 500 ms, 5 s half-life)
+  so a jittery hotspot is not declared down by its own jitter, and it is evaluated on every `Tick` rather than
+  only when a frame is sent. `detect_ms` in the BFD status now reports the live limit. (`7fa3202`)
+
+### v0.1.17 - 2026-11-12
+- **BFD: any authenticated frame counts as hearing the peer.** A loaded or lossy line can lose five BFD frames in
+  a row, or hold them behind bulk traffic, while data, probes and feedback keep arriving; that line was being
+  declared down and the live path thrown away. A line that really stopped delivers nothing, so it is still
+  detected in the same time. (`0295a1c`)
+
+### v0.1.16 - 2026-11-12
+- **Gap feedback at once.** The receiver sends its SACK feedback inside the `Receive` that reveals a sequence gap
+  (at most one per 10 ms per path, counted as `GapFeedback`), so the sender learns of a loss one way trip after it
+  happens instead of after the 20-100 ms feedback timer. (`89623dc`)
+- **Supervision timing through bursts.** Frames are anchored to a fixed cadence instead of drifting, a state
+  change is announced within 100 ms, and while the peer's announcement is overdue (more than 2.5 intervals) the
+  frame is retried every 250 ms. Entries are sorted by path and the change signature ignores RTT, skew and
+  first-wins counters, which removes announcements caused by map iteration order. (`89623dc`)
+- README lists the router, gateway and firewall features and where each lives. (`ef70921`)
+
+### v0.1.15 - 2026-11-12
+- **Fix: receiver feedback carries the SACK bitmap.** The sender could decode and act on the bitmap, but the
+  receiving side never filled it in, so selective-ack loss detection was inactive in production. (`19bdec1`)
+
+### v0.1.14 - 2026-11-12
+- **Redundancy copies ignore BFD down and hold-down.** BFD only keeps first copies off a flapping line. A copy
+  sent into a really dead line costs bandwidth and nothing else, whereas withholding it when BFD is wrong left a
+  single copy, so any loss on that line was permanent. A path silent for 3 s is still left out. (`cea087a`)
+- stream: gateway logs in-flight packets, timeouts and receive-drop reasons. (`2e7fb4c`)
+
+### v0.1.13 - 2026-11-12
+- **stream: ack processing no longer walks the whole history.** The first received range reaches back to the
+  start of the connection, so each ack cost O(history); in-flight polling was O(in-flight). Both now only touch the
+  head of the send order. (`18afeb1`)
+
+### v0.1.12 - 2026-11-12
+- stream: receive drops are counted by reason (`drop_window`, `drop_ooo`). (`b1ed656`)
+
+### v0.1.11 - 2026-11-12
+- **stream: gentler delay shrink.** Only a sustained inflation of twice the recent floor counts as a standing
+  queue; the floor is taken over the last 10-20 s so a route change is not read as a queue forever; send and
+  receive windows are 4 MiB. (`fe44e5d`)
+
+### v0.1.10 - 2026-11-12
+- **Striping only while every path is calm.** It ends at once, for every flow, the moment any path shows a spike,
+  and a hold stops a flapping link from toggling the mode. (`74ca76d`)
+
+### v0.1.9 - 2026-11-12
+- Striped flows are protected by adaptive parity. (`1efc7ee`)
+
+### v0.1.8 - 2026-11-12
+- **Heavy-flow striping (`SetStripeAbove`, `stripe_above_mbps`).** A bulk flow that sustains more than the
+  threshold is sent once, split across the paths, instead of duplicated, so a download is not capped at the slower
+  link. Lost packets are still requested from the repair cache and the flow goes back to duplication when it
+  slows down. 0 keeps every flow duplicated. (`508a752`)
+
+### v0.1.7 - 2026-11-12
+- **Bonded TCP first-arrival.** A TCP packet is delivered on its first copy instead of being held behind a hole,
+  which is almost always the slower path's copy still in flight. Skipped numbers are repaired from the peer's
+  cache if neither copy turns up, and the reorder wait is capped at the path spread plus jitter. (`0189930`)
+
+### v0.1.6 - 2026-11-12
+- **IEC 62439-3 / IEEE 802.1CB alignment.** Elimination window widened to 1<<17 sequence numbers (over 700 ms at
+  1 Gbps with duplication, past the 400 ms PRP forget time), implemented as a ring so advancing is amortised O(1).
+  UDP is delivered on first arrival. Each path records wins and the skew of the second copy, and a path that keeps
+  delivering the second copy of nearly everything is flagged as a latent error. (`8684343`)
+- **Supervision frame.** Each side reports its view of its own paths to the other, and a silent peer is aged out.
+  (`8684343`)
+
+### v0.1.5 - 2026-11-12
+- **`stream` moves here from GameBond.Server** (1,889 lines: `Endpoint`, `Conn`, `Gateway`), so the edge server and
+  the client netstack share one implementation. (`b6f617e`)
+
+### v0.1.4 - 2026-11-12
+- **Burst reduction.** The pacer may release at most 1 ms of backlog at once on a live path (2 ms on the
+  reference clock); the sealed frame is allocated once and the sender reuses its scratch buffers; a reorder hold
+  is capped at 100 ms because the second copy lands within the path skew. Adds a pacing burst profile and a
+  transmit pump benchmark. (`2ec269f`, `566dcec`)
+
+### v0.1.3 - 2026-11-12
+- Assertive delay floor 10 ms to 40 ms, since a loaded LEO link sits at 20-40 ms on its own. A path that mostly
+  carries redundancy copies can now grow when its wire is full and nearly all of it is delivered. (`2605164`)
+
+### v0.1.2 - 2026-11-12
+- The delay back-off cuts a fixed 10% instead of following the delivery rate, which was a ratchet that pinned the
+  rate near the last achieved value. Bulk class limit raised to 2048 packets and the transmit queue to 4096
+  packets / 8 MiB, so a TCP burst is no longer rejected. (`0f1d0e3`)
+
+### v0.1.1 - 2026-11-12
+- The rate controller keeps growing through random loss up to 5% (was 1%), and CoDel is sized for LEO paths
+  (target 50 ms, interval 300 ms; was 12 ms and 120 ms), which treated every burst behind the rate limit as a
+  standing queue and collapsed TCP. (`9b94a98`)
+
+### v0.1.0 - 2026-11-12
+- Initial import of `bond`, `buildinfo` and `hwmon` from GameBond.Client (94 files, 14,668 lines). (`0e9ea9f`)
