@@ -68,7 +68,13 @@ func NewSession(key, session []byte, options SessionOptions) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	r, err := NewReceiver(codec, options.MTU+Overhead+24)
+	// The datagram limit must admit the largest bridged Ethernet frame (plus its marker byte), or the
+	// sender refuses every full-size frame with ErrFrame and TCP through the bridge stalls.
+	limit := options.MTU
+	if options.L2 {
+		limit = max(limit, options.L2MTU()+1)
+	}
+	r, err := NewReceiver(codec, limit+Overhead+24)
 	if err != nil {
 		return nil, err
 	}
