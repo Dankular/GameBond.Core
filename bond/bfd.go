@@ -22,11 +22,11 @@ const (
 	bfdDetectMax = 500 * time.Millisecond
 	// gapPeakHalfLife is how fast the remembered longest gap fades.
 	gapPeakHalfLife = 5 * time.Second
-	// slowPeakHalfLife is the slow memory of the same gap. A line that goes quiet for a quarter of a second every
-	// minute or so forgets it within a few seconds of the fast memory, then is declared down every time. The slow
-	// memory keeps the detect time wide enough for what the line is known to do. Protection does not wait for
-	// the declaration: a path silent for riskFloor already has every packet copied onto the other path.
+	// slowPeakHalfLife is the slow memory of the longest gap, kept for the status. Detection does not use it:
+	// a path is declared down as soon as it has been silent too long, so a real failure is never waited out.
 	slowPeakHalfLife = 5 * time.Minute
+	// blipMax: a path that was declared down and is heard again within this long had a blip, not an outage.
+	blipMax = time.Second
 	// Hold-down after a failure: short the first time, doubling for each further failure
 	// within bfdFlapWindow, so a flapping line is kept out longer but one blip is not. Every
 	// packet is also copied onto the other line, so letting a recovering line back early
@@ -113,9 +113,6 @@ func (p *receivePath) fadedGapPeak(now time.Time) time.Duration {
 // bfdLimit is how long the path may be silent before it counts as not heard.
 func (p *receivePath) bfdLimit(now time.Time) time.Duration {
 	limit := p.fadedGapPeak(now) * 3 / 2
-	if slow := p.fadedSlowPeak(now) * 5 / 4; slow > limit {
-		limit = slow
-	}
 	if limit < bfdDetectMin {
 		limit = bfdDetectMin
 	}
@@ -190,6 +187,9 @@ func (r *Receiver) bfdEvaluate(p *receivePath, now time.Time) {
 	if wentDown {
 		r.noteLine(p, now, OutageLinkDown, b.cause, 0)
 	} else if cameUp && !b.lastDown.IsZero() { // a recovery, not the first exchange
+		if now.Sub(b.lastDown) <= blipMax {
+			r.stats.PathStalls++
+		}
 		r.noteLine(p, now, OutageLinkUp, "", now.Sub(b.lastDown))
 	}
 }
