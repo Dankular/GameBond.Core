@@ -847,13 +847,22 @@ func (r *Receiver) updateReorderBudget() {
 	if count >= 2 {
 		timeout = math.Min(timeout, math.Max(r.reorderBase.Seconds(), (maximum-minimum)/2+4*jitter))
 	}
-	r.reorder.config.Timeout = time.Duration(timeout * float64(time.Second))
 	udp := timeout
 	if count >= 2 {
 		udp = math.Min(timeout, math.Max(r.reorderBase.Seconds(), (maximum-minimum)/2+2*jitter))
 	}
+	// A hole in a TCP flow is repaired by a resend, which needs a round trip: wait for it
+	// (the slowest ready path's RTT plus jitter) instead of skipping the gap before the repair can
+	// arrive, which TCP reads as loss. UDP keeps its own short timeout, so game traffic is not delayed.
+	if count >= 1 {
+		timeout = math.Max(timeout, math.Min(tcpHoleCeiling, 1.25*maximum+4*jitter+.005))
+	}
+	r.reorder.config.Timeout = time.Duration(timeout * float64(time.Second))
 	r.reorder.config.UDPTimeout = time.Duration(udp * float64(time.Second))
 }
+
+// tcpHoleCeiling bounds how long a TCP hole may hold a flow while its repair is on the way.
+const tcpHoleCeiling = .25
 
 type recoveryState struct {
 	nonce [16]byte
