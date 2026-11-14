@@ -36,7 +36,7 @@ func TestReplaySkippedWhenAHealthyPathHoldsACopy(t *testing.T) {
 	s.cacheRepair(alone, tcpPacket("b"), f.now, p0)
 	p0.last = f.now
 	s.queueReplays(p0, f.now)
-	if len(s.replayBulk) != 1 || s.replayBulk[0].key != alone || s.Stats().ReplaySkipped != 1 {
+	if len(s.replayQueue) != 1 || s.replayQueue[0].key != alone || s.Stats().ReplaySkipped != 1 {
 		t.Fatalf("queue %v stats %+v", s.replayQueue, s.Stats())
 	}
 }

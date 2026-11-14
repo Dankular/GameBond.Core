@@ -64,8 +64,6 @@ type ReceiverStats struct {
 	BFDSent, BFDReceived, BFDUp, BFDDown, PathStalls         uint64
 }
 type receivePath struct {
-	recoveryTokens float64 // bytes of recovery traffic this path may send now
-	recoveryAt     time.Time
 	copySeen, copyMissed, copyLate   uint64
 	copyLagMS                        float64
 	firstWins, lateCopies            uint64
