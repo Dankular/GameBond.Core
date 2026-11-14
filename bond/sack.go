@@ -121,9 +121,7 @@ func (s *Sender) sackLoss(key MissingPacket, now time.Time) {
 		s.stats.SackHeld++
 		return
 	}
-	if s.repairRequests[key] == nil {
-		s.repairRequests[key] = s.requestOrder.PushBack(key)
-	}
+	s.queueRepair(key, cached.payload)
 	s.stats.SackResent++
 }
 
