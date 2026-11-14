@@ -25,6 +25,12 @@ type SessionOptions struct {
 	Redundant                bool
 	// Optional behaviours, all off by default like the Python server.
 	LossTracking, PathMTUDiscovery, FailoverReplay bool
+	// L2 carries Ethernet frames (a Data payload behind L2Marker) between the peers' bridged
+	// ports. Off by default: with it off a marked payload fails the IPv4 parse like any junk.
+	L2 bool
+	// L2FrameMTU is the largest Ethernet frame carried (0 = DefaultL2FrameMTU). Larger frames are
+	// dropped and counted, never fragmented or passed silently.
+	L2FrameMTU int
 	FlowPinning, CoDel                             bool
 	StripeAbove                                    float64
 	ParityRowsMin, ParityRowsMax                   int
@@ -35,7 +41,12 @@ func DefaultSessionOptions() SessionOptions {
 	return SessionOptions{MTU: 1280, ClientIP: netip.MustParseAddr("10.77.0.2"), InitialRate: 1, MaximumRate: 100, ReorderTimeout: 30 * time.Millisecond, QoS: DefaultQoSSettings()}
 }
 
-type SessionStats struct{ Malformed, IPv6Unsupported, MTUDrops, WrongSource, WrongDestination, OutboundPackets, OutboundBytes, InboundPackets, InboundBytes uint64 }
+type SessionStats struct {
+	Malformed, IPv6Unsupported, MTUDrops, WrongSource, WrongDestination, OutboundPackets, OutboundBytes, InboundPackets, InboundBytes uint64
+	// Layer 2 carriage: frames accepted, of which control (ARP, DHCP, ND, IGMP, LLDP, EAPOL, BPDU),
+	// and frames refused for size or because carriage is off.
+	L2Frames, L2Control, L2Oversize, L2Refused uint64
+}
 type Session struct {
 	Receiver   *Receiver
 	Sender     *Sender
@@ -111,6 +122,13 @@ func (s *Session) syncPeer() {
 	}
 }
 func (s *Session) classify(packet []byte, incoming bool, now time.Time) (Classification, bool) {
+	if len(packet) > 0 && packet[0] == L2Marker {
+		if !s.options.L2 {
+			s.stats.L2Refused++
+			return Classification{}, false
+		}
+		return s.classifyFrame(packet, now)
+	}
 	if len(packet) > s.options.MTU {
 		s.stats.MTUDrops++
 		return Classification{}, false
