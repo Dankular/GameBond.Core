@@ -109,8 +109,10 @@ func TestFailoverReplaysBlackholedUplink(t *testing.T) {
 	if sender.stats.FailoverSuspected != 1 {
 		t.Fatalf("want one suspicion, stats %+v", sender.stats)
 	}
-	if sender.stats.FailoverReplayed == 0 {
-		t.Fatalf("nothing replayed, stats %+v", sender.stats)
+	// Every packet on the dead path was either replayed or left alone because a
+	// copy already sat on the live path (these flows are duplicated).
+	if sender.stats.FailoverReplayed+sender.stats.ReplaySkipped == 0 {
+		t.Fatalf("nothing replayed or accounted for, stats %+v", sender.stats)
 	}
 	if !cr.paths[PathKey{1, srv}].suspect {
 		t.Fatal("blackholed path not marked suspect")

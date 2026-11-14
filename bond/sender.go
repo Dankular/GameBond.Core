@@ -47,6 +47,10 @@ type SenderStats struct {
 	// immediate resend, held back because a sibling copy may still arrive, or not
 	// recoverable (no cached payload: UDP, or too old).
 	SackLost, SackResent, SackHeld, SackUnrecoverable uint64
+	// Why a lost frame could not be resent: never cached (UDP or oversize), gone from
+	// the cache by age or size, or every resend attempt used. ReplaySkipped counts
+	// failover replays not sent because a healthy path already held a copy.
+	SackNotRepairable, SackExpired, SackExhausted, ReplaySkipped uint64
 	TailProbed, ParityRSSent                          uint64
 }
 
@@ -89,6 +93,8 @@ type Sender struct {
 	lossTiered        bool // tests only: loss-driven parity/duplication instead of always duplicating
 	lossTracking      bool
 	replayQueue       []replayItem
+	notCached         map[MissingPacket]struct{}
+	notCachedOrder    []MissingPacket
 	hints             map[int]pathHint
 }
 

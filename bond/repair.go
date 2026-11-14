@@ -18,6 +18,19 @@ type repairEntry struct {
 	// resends) and lost how many of them the peer's selective acknowledgement showed
 	// were dropped. When every one is lost the packet is gone unless we send it again.
 	sent, lost int
+	// carried lists every path a frame of this packet went out on (original,
+	// copies, resends, replays), so a failover replay can see that a healthy
+	// path already holds a copy.
+	carried []*receivePath
+}
+
+func (e *repairEntry) carry(p *receivePath) {
+	for _, q := range e.carried {
+		if q == p {
+			return
+		}
+	}
+	e.carried = append(e.carried, p)
 }
 type askedRepair struct {
 	key      MissingPacket
@@ -54,9 +67,10 @@ func repairable(packet []byte) bool {
 }
 func (s *Sender) cacheRepair(key MissingPacket, payload []byte, now time.Time, origin *receivePath) {
 	if len(payload) > 2048 || !(s.failover || repairable(payload)) {
+		s.noteNotCached(key)
 		return
 	}
-	entry := &repairEntry{key: key, payload: append([]byte(nil), payload...), at: now, origin: origin, sent: 1}
+	entry := &repairEntry{key: key, payload: append([]byte(nil), payload...), at: now, origin: origin, sent: 1, carried: []*receivePath{origin}}
 	entry.order = s.repairOrder.PushBack(entry)
 	s.repairs[key] = entry
 	for len(s.repairs) > repairCacheMax {
@@ -221,6 +235,7 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 			cached.sent++
 			cached.attempts++
 			cached.origin = target
+			cached.carry(target)
 			delete(s.repairRequests, key)
 			s.requestOrder.Remove(e)
 			s.stats.RepairCopies++

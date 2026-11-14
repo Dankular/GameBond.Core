@@ -90,8 +90,18 @@ func (s *Sender) sackLoss(key MissingPacket, now time.Time) {
 	s.stats.SackLost++
 	s.addLossHeat(now)
 	cached := s.repairs[key]
-	if cached == nil || cached.attempts >= repairAttempts {
+	if cached == nil {
 		s.stats.SackUnrecoverable++
+		if s.wasNotCached(key) {
+			s.stats.SackNotRepairable++
+		} else {
+			s.stats.SackExpired++
+		}
+		return
+	}
+	if cached.attempts >= repairAttempts {
+		s.stats.SackUnrecoverable++
+		s.stats.SackExhausted++
 		return
 	}
 	cached.lost++

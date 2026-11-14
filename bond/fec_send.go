@@ -135,6 +135,7 @@ func (s *Sender) duplicate(f *sendFlow, number uint64, payload []byte, used *rec
 		target.budget.Tag(sequence, key)
 		if cached := s.repairs[key]; cached != nil {
 			cached.sent++
+			cached.carry(target)
 		}
 		s.stats.Copies++
 		s.stats.BulkDuplicates++

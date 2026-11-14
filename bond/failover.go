@@ -81,7 +81,7 @@ func (s *Sender) failoverStep(now time.Time, writer DatagramWriter) error {
 		case suspect && !p.suspect:
 			p.suspect = true
 			s.stats.FailoverSuspected++
-			s.queueReplays(p)
+			s.queueReplays(p, now)
 		case !suspect && p.suspect:
 			p.suspect = false
 			s.stats.FailoverRecovered++
@@ -140,6 +140,7 @@ func (s *Sender) failoverStep(now time.Time, writer DatagramWriter) error {
 		target.budget.Tag(sequence, item.key)
 		cached.sent++
 		cached.origin = target
+		cached.carry(target)
 		s.replayQueue = s.replayQueue[1:]
 		s.stats.FailoverReplayed++
 		s.stats.Copies++
@@ -148,14 +149,30 @@ func (s *Sender) failoverStep(now time.Time, writer DatagramWriter) error {
 	return nil
 }
 
+// healthySibling reports whether a path other than p, still ready and not
+// suspect, already carried a copy of the packet. Replaying it would only add a
+// duplicate: if that copy is lost too, the selective acknowledgement resends it.
+func (s *Sender) healthySibling(e *repairEntry, p *receivePath, now time.Time) bool {
+	for _, q := range e.carried {
+		if q != p && q.ready && !q.suspect && !s.pathSuspect(q, now) {
+			return true
+		}
+	}
+	return false
+}
+
 // queueReplays queues the cached packets p carried since just before it went
 // quiet, oldest first, at most failoverCacheLimit.
-func (s *Sender) queueReplays(p *receivePath) {
+func (s *Sender) queueReplays(p *receivePath, now time.Time) {
 	since := p.last.Add(-time.Duration(p.rtt * float64(time.Second)))
 	var picked []MissingPacket
 	for e := s.repairOrder.Back(); e != nil && len(picked) < failoverCacheLimit; e = e.Prev() {
 		entry := e.Value.(*repairEntry)
 		if entry.origin == p && !entry.at.Before(since) {
+			if s.healthySibling(entry, p, now) {
+				s.stats.ReplaySkipped++
+				continue
+			}
 			picked = append(picked, entry.key)
 		}
 	}
