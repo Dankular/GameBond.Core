@@ -5,32 +5,58 @@ import (
 	"time"
 )
 
-func TestRecoveryIsHeldToAShareOfTheLink(t *testing.T) {
+func TestRecoveryIsUnlimitedWhenNoGameTrafficFlows(t *testing.T) {
 	f, s, a := senderFixture(t, 2)
 	p := f.r.paths[pk(a[0])]
-	p.budget.rate = 1_000_000 // 1 MB/s link: burst is the 6000 byte floor
+	p.budget.rate = 1_000_000
+	for i := 0; i < 500; i++ { // a download being repaired
+		if !s.recoveryAllow(p, 1400, f.now) {
+			t.Fatalf("held back repair %d with no game traffic to protect", i)
+		}
+		s.recoverySpent(p, 1400, f.now)
+	}
+}
+
+func TestRecoveryIsSmoothedWhileAGameRunsButNeverHeldLong(t *testing.T) {
+	f, s, a := senderFixture(t, 2)
+	p := f.r.paths[pk(a[0])]
+	p.budget.rate = 1_000_000
+	s.noteGame(f.now)
 	sent := 0
 	for s.recoveryAllow(p, 1400, f.now) {
 		s.recoverySpent(p, 1400, f.now)
 		sent++
 		if sent > 100 {
-			t.Fatal("no limit")
+			t.Fatal("no limit while a game runs")
 		}
 	}
 	if sent < 3 || sent > 5 {
-		t.Fatalf("burst of %d packets, want about 4 (6000 bytes)", sent)
+		t.Fatalf("burst of %d packets, want about 4", sent)
 	}
-	if s.Stats().RecoveryPeak10ms != uint64(sent) {
-		t.Fatalf("peak %d, want %d", s.Stats().RecoveryPeak10ms, sent)
+	// Held, but only for recoveryMaxDelay: then it opens (and stays open briefly).
+	at := f.now.Add(recoveryMaxDelay + time.Millisecond)
+	s.noteGame(at)
+	// A packet larger than the refill so far (13 ms buys about 2.6 KB) is held, then let through.
+	if !s.recoveryAllow(p, 5000, at) || s.Stats().RecoveryEscapes != 1 {
+		t.Fatalf("a repair was held past %v: %+v", recoveryMaxDelay, s.Stats())
 	}
-	// 20% of 1 MB/s is 200 KB/s: 10 ms buys 2000 bytes, one more packet.
-	later := f.now.Add(10 * time.Millisecond)
-	if !s.recoveryAllow(p, 1400, later) {
-		t.Fatal("no refill after 10 ms")
+	for i := 0; i < 50; i++ {
+		if !s.recoveryAllow(p, 1400, at.Add(10*time.Millisecond)) {
+			t.Fatal("limit closed during the escape")
+		}
+		s.recoverySpent(p, 1400, at.Add(10*time.Millisecond))
 	}
-	s.recoverySpent(p, 1400, later)
-	if s.recoveryAllow(p, 1400, later) {
-		t.Fatal("refill is faster than the share")
+}
+
+func TestRecoveryShareGrowsWithLoss(t *testing.T) {
+	f, s, a := senderFixture(t, 2)
+	p := f.r.paths[pk(a[0])]
+	if got := s.recoveryShare(p, f.now); got != recoveryShareMin {
+		t.Fatalf("share %v with no loss, want %v", got, recoveryShareMin)
+	}
+	p.budget.lossSeen, p.budget.lossAt, p.budget.lossEWMA = true, s.r.seconds(f.now), 0.05
+	if got := s.recoveryShare(p, f.now); got <= recoveryShareMin || got > recoveryShareMax {
+		t.Fatalf("share %v at 5%% loss", got)
 	}
 }
 
@@ -49,16 +75,22 @@ func TestGameRepairsGoAheadOfTCP(t *testing.T) {
 	}
 }
 
-func TestStaleReplaysAreDropped(t *testing.T) {
+func TestOnlyStaleGameReplaysAreDropped(t *testing.T) {
 	f, s, a := senderFixture(t, 2)
 	p := f.r.paths[pk(a[0])]
-	key := MissingPacket{Flow: 1, Number: 1}
-	s.cacheRepair(key, tcpPacket("old"), f.now, p)
-	s.replayBulk = append(s.replayBulk, replayItem{key})
-	if err := s.failoverStep(f.now.Add(replayMaxAge+time.Second), func(Datagram) error { return nil }); err != nil {
-		t.Fatal(err)
+	s.failover = true
+	game := MissingPacket{Flow: 1, Number: 1}
+	bulk := MissingPacket{Flow: 1, Number: 2}
+	s.cacheRepair(game, []byte("game"), f.now, p)
+	s.cacheRepair(bulk, tcpPacket("old"), f.now, p)
+	s.replayQueue = append(s.replayQueue, replayItem{game})
+	s.replayBulk = append(s.replayBulk, replayItem{bulk})
+	late := f.now.Add(replayMaxAge + time.Second)
+	_ = s.failoverStep(late, func(Datagram) error { return nil })
+	if len(s.replayQueue) != 0 {
+		t.Fatalf("stale game replay kept: %v", s.replayQueue)
 	}
-	if len(s.replayBulk) != 0 || s.Stats().FailoverReplayDropped == 0 || s.Stats().FailoverReplayed != 0 {
-		t.Fatalf("queue %v stats %+v", s.replayBulk, s.Stats())
+	if st := s.Stats(); st.FailoverReplayDropped == 0 {
+		t.Fatalf("nothing dropped: %+v", st)
 	}
 }

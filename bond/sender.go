@@ -54,6 +54,8 @@ type SenderStats struct {
 	// RecoveryPeak10ms is the most recovery frames (resends and replays) sent in any
 	// 10 ms window: how bursty recovery has been.
 	RecoveryPeak10ms uint64
+	// RecoveryEscapes counts times a repair had been held the full limit and was let through.
+	RecoveryEscapes uint64
 	TailProbed, ParityRSSent                          uint64
 }
 
@@ -98,6 +100,9 @@ type Sender struct {
 	replayQueue       []replayItem // game traffic first
 	replayBulk        []replayItem // TCP segments: TCP resends these itself
 	recWinStart       time.Time
+	lastGame          time.Time // last latency-sensitive (non-TCP) packet sent
+	recHeldSince      time.Time
+	recEscapeUntil    time.Time
 	recWinCount       uint64
 	tombs             map[MissingPacket]*tombstone
 	tombOrder         []tombstoneRef
@@ -433,6 +438,8 @@ func (s *Sender) Urgent(payload []byte, replicate bool, now time.Time, writer Da
 	if sent > 0 {
 		if IsTCPControl(payload) {
 			s.stats.TCPControlPackets++
+		} else {
+			s.noteGame(now)
 		}
 		s.stats.PayloadPackets++
 		s.stats.PayloadBytes += uint64(len(payload))

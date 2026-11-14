@@ -98,8 +98,8 @@ func (s *Sender) failoverStep(now time.Time, writer DatagramWriter) error {
 		}
 		item := (*queue)[0]
 		cached := s.repairs[item.key]
-		if cached == nil || now.Sub(cached.at) > replayMaxAge {
-			// Gone, or too old to matter to a game; TCP has resent it by now.
+		if cached == nil || (queue == &s.replayQueue && now.Sub(cached.at) > replayMaxAge) {
+			// Gone, or a game packet too old to matter. TCP segments are always replayed.
 			*queue = (*queue)[1:]
 			s.stats.FailoverReplayDropped++
 			continue
