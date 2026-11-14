@@ -88,11 +88,19 @@ func (s *Sender) failoverStep(now time.Time, writer DatagramWriter) error {
 		}
 	}
 	timestamp := s.r.seconds(now)
-	for sent := 0; sent < failoverPerTick && len(s.replayQueue) > 0; {
-		item := s.replayQueue[0]
+	for sent := 0; sent < failoverPerTick; {
+		queue := &s.replayQueue
+		if len(*queue) == 0 {
+			queue = &s.replayBulk
+		}
+		if len(*queue) == 0 {
+			break
+		}
+		item := (*queue)[0]
 		cached := s.repairs[item.key]
-		if cached == nil {
-			s.replayQueue = s.replayQueue[1:]
+		if cached == nil || now.Sub(cached.at) > replayMaxAge {
+			// Gone, or too old to matter to a game; TCP has resent it by now.
+			*queue = (*queue)[1:]
 			s.stats.FailoverReplayDropped++
 			continue
 		}
@@ -104,7 +112,7 @@ func (s *Sender) failoverStep(now time.Time, writer DatagramWriter) error {
 			if err != nil {
 				return err
 			}
-			if math.Max(ready, p.pacer.ReadyAt(size+28, timestamp)) > timestamp+.000001 {
+			if math.Max(ready, p.pacer.ReadyAt(size+28, timestamp)) > timestamp+.000001 || !s.recoveryAllow(p, size+28, now) {
 				continue
 			}
 			probe := 0.
@@ -118,8 +126,8 @@ func (s *Sender) failoverStep(now time.Time, writer DatagramWriter) error {
 		if target == nil {
 			if len(live) == 0 {
 				// Nothing to replay on: drop rather than hold stale packets.
-				s.stats.FailoverReplayDropped += uint64(len(s.replayQueue))
-				s.replayQueue = nil
+				s.stats.FailoverReplayDropped += uint64(len(s.replayQueue) + len(s.replayBulk))
+				s.replayQueue, s.replayBulk = nil, nil
 			}
 			break
 		}
@@ -141,7 +149,8 @@ func (s *Sender) failoverStep(now time.Time, writer DatagramWriter) error {
 		cached.sent++
 		cached.origin = target
 		cached.carry(target)
-		s.replayQueue = s.replayQueue[1:]
+		*queue = (*queue)[1:]
+		s.recoverySpent(target, size+28, now)
 		s.stats.FailoverReplayed++
 		s.stats.Copies++
 		sent++
@@ -177,6 +186,10 @@ func (s *Sender) queueReplays(p *receivePath, now time.Time) {
 		}
 	}
 	for i := len(picked) - 1; i >= 0; i-- {
-		s.replayQueue = append(s.replayQueue, replayItem{picked[i]})
+		if entry := s.repairs[picked[i]]; entry != nil && !repairable(entry.payload) {
+			s.replayQueue = append(s.replayQueue, replayItem{picked[i]})
+		} else {
+			s.replayBulk = append(s.replayBulk, replayItem{picked[i]})
+		}
 	}
 }

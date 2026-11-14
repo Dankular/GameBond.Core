@@ -194,6 +194,7 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 			s.stats.RepairThrottled++
 			break
 		}
+		refund := func() { s.repairTokens++ }
 		size := len(cached.payload) + Overhead + 24
 		var target *receivePath
 		bestScore := math.Inf(1)
@@ -206,6 +207,9 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 			// go out at once instead of queueing behind the path's bulk pacing; the wait
 			// only decides which path is cheapest.
 			ready = math.Max(ready, p.pacer.ReadyAt(size+28, timestamp))
+			if !s.recoveryAllow(p, size+28, now) {
+				continue // recovery is held to a share of each link
+			}
 			probe := 0.
 			if p.hasRTT {
 				probe = p.rtt
@@ -220,6 +224,8 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 			}
 		}
 		if target == nil {
+			refund()
+			s.stats.RepairThrottled++
 			break
 		}
 		body := make([]byte, 24+len(cached.payload))
@@ -239,6 +245,7 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 			cached.attempts++
 			cached.origin = target
 			cached.carry(target)
+			s.recoverySpent(target, size+28, now)
 			delete(s.repairRequests, key)
 			s.requestOrder.Remove(e)
 			s.stats.RepairCopies++

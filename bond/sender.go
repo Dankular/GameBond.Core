@@ -51,6 +51,9 @@ type SenderStats struct {
 	// the cache by age or size, or every resend attempt used. ReplaySkipped counts
 	// failover replays not sent because a healthy path already held a copy.
 	SackNotRepairable, SackExpired, SackExhausted, ReplaySkipped uint64
+	// RecoveryPeak10ms is the most recovery frames (resends and replays) sent in any
+	// 10 ms window: how bursty recovery has been.
+	RecoveryPeak10ms uint64
 	TailProbed, ParityRSSent                          uint64
 }
 
@@ -92,7 +95,10 @@ type Sender struct {
 	calm              bool
 	lossTiered        bool // tests only: loss-driven parity/duplication instead of always duplicating
 	lossTracking      bool
-	replayQueue       []replayItem
+	replayQueue       []replayItem // game traffic first
+	replayBulk        []replayItem // TCP segments: TCP resends these itself
+	recWinStart       time.Time
+	recWinCount       uint64
 	tombs             map[MissingPacket]*tombstone
 	tombOrder         []tombstoneRef
 	hints             map[int]pathHint
@@ -190,6 +196,7 @@ func (s *Sender) syncPeer() {
 		s.askedOrder.Init()
 		s.nextRepairRequest = time.Time{}
 		s.replayQueue = nil
+		s.replayBulk = nil
 	}
 }
 func (s *Sender) eligible(now time.Time, boost bool) []*receivePath {
@@ -361,7 +368,9 @@ func (s *Sender) Controls(result ReceiveResult, now time.Time, writer DatagramWr
 			}
 			continue
 		}
-		if s.repairRequests[key] == nil {
+		if cached := s.repairs[key]; cached != nil {
+			s.queueRepair(key, cached.payload)
+		} else if s.repairRequests[key] == nil {
 			s.repairRequests[key] = s.requestOrder.PushBack(key)
 		}
 		if len(s.repairRequests) > 4096 {
