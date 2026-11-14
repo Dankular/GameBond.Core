@@ -18,7 +18,7 @@ func TestStallIsCountedAndRemembered(t *testing.T) {
 	if p.touch(t0.Add(300 * time.Millisecond)) {
 		t.Fatal("a 50 ms gap is normal, not a stall")
 	}
-	if limit := p.bfdLimit(t0.Add(90 * time.Second)); limit < 300*time.Millisecond {
+	if limit := p.bfdLimit(t0.Add(90 * time.Second)); limit <= bfdDetectMin {
 		t.Fatalf("90 s later the detect time is %v: the line's stall was forgotten", limit)
 	}
 	p.bfd.up = false
