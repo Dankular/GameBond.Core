@@ -22,6 +22,11 @@ const (
 	bfdDetectMax = 500 * time.Millisecond
 	// gapPeakHalfLife is how fast the remembered longest gap fades.
 	gapPeakHalfLife = 5 * time.Second
+	// slowPeakHalfLife is the slow memory of the same gap. A line that goes quiet for a quarter of a second every
+	// minute or so forgets it within a few seconds of the fast memory, then is declared down every time. The slow
+	// memory keeps the detect time wide enough for what the line is known to do. Protection does not wait for
+	// the declaration: a path silent for riskFloor already has every packet copied onto the other path.
+	slowPeakHalfLife = 5 * time.Minute
 	// Hold-down after a failure: short the first time, doubling for each further failure
 	// within bfdFlapWindow, so a flapping line is kept out longer but one blip is not. Every
 	// packet is also copied onto the other line, so letting a recovering line back early
@@ -64,14 +69,33 @@ func (b *bfdState) hears(now time.Time) bool {
 }
 
 // touch records an authenticated frame from the peer on the path and the gap since the previous
-// one, which is the line's own evidence of how long a healthy stall can last.
-func (p *receivePath) touch(now time.Time) {
+// one, which is the line's own evidence of how long a healthy stall can last. It reports a stall: the
+// path went quiet for at least the calm detect time, was not declared down for it, and has now resumed.
+func (p *receivePath) touch(now time.Time) (stalled bool) {
 	if !p.last.IsZero() {
-		if gap := now.Sub(p.last); gap > 0 && gap < 2*time.Second && gap >= p.fadedGapPeak(now) {
-			p.gapPeak, p.gapPeakAt = gap, now
+		if gap := now.Sub(p.last); gap > 0 && gap < 2*time.Second {
+			if gap >= p.fadedGapPeak(now) {
+				p.gapPeak, p.gapPeakAt = gap, now
+			}
+			if gap >= p.fadedSlowPeak(now) {
+				p.slowPeak, p.slowPeakAt = gap, now
+			}
+			stalled = gap >= bfdDetectMin && p.bfd.up
 		}
 	}
 	p.last = now
+	return stalled
+}
+
+// fadedSlowPeak is the slowly fading longest gap.
+func (p *receivePath) fadedSlowPeak(now time.Time) time.Duration {
+	if p.slowPeak <= 0 {
+		return 0
+	}
+	if age := now.Sub(p.slowPeakAt); age > 0 {
+		return time.Duration(float64(p.slowPeak) * math.Exp2(-float64(age)/float64(slowPeakHalfLife)))
+	}
+	return p.slowPeak
 }
 
 // fadedGapPeak is the remembered longest gap after fading.
@@ -89,6 +113,9 @@ func (p *receivePath) fadedGapPeak(now time.Time) time.Duration {
 // bfdLimit is how long the path may be silent before it counts as not heard.
 func (p *receivePath) bfdLimit(now time.Time) time.Duration {
 	limit := p.fadedGapPeak(now) * 3 / 2
+	if slow := p.fadedSlowPeak(now) * 5 / 4; slow > limit {
+		limit = slow
+	}
 	if limit < bfdDetectMin {
 		limit = bfdDetectMin
 	}

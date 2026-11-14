@@ -60,7 +60,7 @@ type ReceiverStats struct {
 	PolicyDrops                                                uint64
 	FECParity, FECRecovered, FECRecoveredRS                    uint64
 	ReorderScale                                               float64
-	BFDSent, BFDReceived, BFDUp, BFDDown                       uint64
+	BFDSent, BFDReceived, BFDUp, BFDDown, PathStalls         uint64
 }
 type receivePath struct {
 	copySeen, copyMissed, copyLate   uint64
@@ -77,6 +77,8 @@ type receivePath struct {
 	last                             time.Time
 	gapPeak                          time.Duration // longest recent gap between frames (faded by fadedGapPeak)
 	gapPeakAt                        time.Time
+	slowPeak                         time.Duration // the same, remembered for minutes: a line that stalls now and then keeps doing so
+	slowPeakAt                       time.Time
 	lastSequence                     uint64
 	txEpoch, rxEpoch                 uint64
 	hasEpoch                         bool
@@ -450,7 +452,9 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 		r.stats.PolicyDrops++
 		return out, nil
 	}
-	p.touch(now)
+	if p.touch(now) {
+		r.stats.PathStalls++
+	}
 	out.Authenticated = true
 	if h.Sequence > p.lastSequence {
 		p.lastSequence = h.Sequence

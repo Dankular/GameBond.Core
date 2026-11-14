@@ -257,7 +257,12 @@ func TestBFDDetectTimeFadesBackToTheFloor(t *testing.T) {
 	if got := path.bfdLimit(t0.Add(400 * time.Millisecond)); got < 500*time.Millisecond-time.Millisecond {
 		t.Fatalf("limit right after a 400 ms stall is %v, want the 500 ms cap", got)
 	}
-	if got := path.bfdLimit(t0.Add(60 * time.Second)); got != bfdDetectMin {
-		t.Fatalf("limit a minute later is %v, want the %v floor", got, bfdDetectMin)
+	// The fast memory is gone within a minute, but the slow one keeps a line that stalls now and then from being
+	// declared down every time: the limit stays wide for a few minutes, then returns to the floor.
+	if got := path.bfdLimit(t0.Add(60 * time.Second)); got <= bfdDetectMin || got > 500*time.Millisecond {
+		t.Fatalf("limit a minute later is %v, want it still widened by the slow memory", got)
+	}
+	if got := path.bfdLimit(t0.Add(time.Hour)); got != bfdDetectMin {
+		t.Fatalf("limit an hour later is %v, want the %v floor", got, bfdDetectMin)
 	}
 }
