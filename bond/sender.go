@@ -93,8 +93,8 @@ type Sender struct {
 	lossTiered        bool // tests only: loss-driven parity/duplication instead of always duplicating
 	lossTracking      bool
 	replayQueue       []replayItem
-	notCached         map[MissingPacket]struct{}
-	notCachedOrder    []MissingPacket
+	tombs             map[MissingPacket]*tombstone
+	tombOrder         []tombstoneRef
 	hints             map[int]pathHint
 }
 

@@ -136,6 +136,8 @@ func (s *Sender) duplicate(f *sendFlow, number uint64, payload []byte, used *rec
 		if cached := s.repairs[key]; cached != nil {
 			cached.sent++
 			cached.carry(target)
+		} else if t := s.tombs[key]; t != nil {
+			t.sent++
 		}
 		s.stats.Copies++
 		s.stats.BulkDuplicates++

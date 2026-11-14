@@ -67,7 +67,7 @@ func repairable(packet []byte) bool {
 }
 func (s *Sender) cacheRepair(key MissingPacket, payload []byte, now time.Time, origin *receivePath) {
 	if len(payload) > 2048 || !(s.failover || repairable(payload)) {
-		s.noteNotCached(key)
+		s.noteNotCached(key, now)
 		return
 	}
 	entry := &repairEntry{key: key, payload: append([]byte(nil), payload...), at: now, origin: origin, sent: 1, carried: []*receivePath{origin}}
@@ -75,6 +75,7 @@ func (s *Sender) cacheRepair(key MissingPacket, payload []byte, now time.Time, o
 	s.repairs[key] = entry
 	for len(s.repairs) > repairCacheMax {
 		old := s.repairOrder.Front().Value.(*repairEntry)
+		s.retire(old, now)
 		delete(s.repairs, old.key)
 		s.repairOrder.Remove(old.order)
 	}
@@ -90,9 +91,11 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 		if now.Sub(old.at) < s.repairLife() {
 			break
 		}
+		s.retire(old, now)
 		delete(s.repairs, old.key)
 		s.repairOrder.Remove(old.order)
 	}
+	s.pruneTombstones(now)
 	for s.askedOrder.Len() > 0 {
 		old := s.askedOrder.Front().Value.(*askedRepair)
 		if now.Sub(old.at) < 5*time.Second && len(s.asked) <= 16384 {

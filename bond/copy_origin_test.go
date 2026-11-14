@@ -40,3 +40,22 @@ func TestReplaySkippedWhenAHealthyPathHoldsACopy(t *testing.T) {
 		t.Fatalf("queue %v stats %+v", s.replayQueue, s.Stats())
 	}
 }
+
+// A loss report that arrives after the payload left the cache is still judged by
+// how many copies went out: with a sibling unaccounted for it is covered.
+func TestLateLossReportUsesTheTombstone(t *testing.T) {
+	f, s, a := senderFixture(t, 2)
+	key := MissingPacket{Flow: 3, Number: 1}
+	s.cacheRepair(key, tcpPacket("z"), f.now, f.r.paths[pk(a[0])])
+	s.repairs[key].sent = 2 // original + duplicate
+	s.retire(s.repairs[key], f.now)
+	delete(s.repairs, key)
+	s.sackLoss(key, f.now)
+	if st := s.Stats(); st.SackHeld != 1 || st.SackUnrecoverable != 0 {
+		t.Fatalf("first copy of a retired packet: %+v", st)
+	}
+	s.sackLoss(key, f.now)
+	if st := s.Stats(); st.SackUnrecoverable != 1 || st.SackExpired != 1 {
+		t.Fatalf("both copies of a retired packet: %+v", st)
+	}
+}

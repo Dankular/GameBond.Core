@@ -91,12 +91,24 @@ func (s *Sender) sackLoss(key MissingPacket, now time.Time) {
 	s.addLossHeat(now)
 	cached := s.repairs[key]
 	if cached == nil {
-		s.stats.SackUnrecoverable++
-		if s.wasNotCached(key) {
-			s.stats.SackNotRepairable++
-		} else {
-			s.stats.SackExpired++
+		// No payload to resend. The tombstone still knows how many copies went out,
+		// so a loss with a sibling copy unaccounted for is covered, not unrecovered.
+		if t := s.tombs[key]; t != nil {
+			t.lost++
+			if t.lost < t.sent {
+				s.stats.SackHeld++
+				return
+			}
+			s.stats.SackUnrecoverable++
+			if t.uncached {
+				s.stats.SackNotRepairable++
+			} else {
+				s.stats.SackExpired++
+			}
+			return
 		}
+		s.stats.SackUnrecoverable++
+		s.stats.SackExpired++ // too old even for a tombstone
 		return
 	}
 	if cached.attempts >= repairAttempts {
