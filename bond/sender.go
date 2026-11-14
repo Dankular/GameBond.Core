@@ -42,7 +42,7 @@ const (
 )
 
 type SenderStats struct {
-	PayloadPackets, PayloadBytes, Copies, StripedPackets, PriorityCopies, TCPControlPackets, WireLimited, SocketErrors, RepairCopies, RepairRequests, RepairUnavailableSent, RepairExhausted, RepairThrottled, MTUNoFit, FailoverSuspected, FailoverRecovered, FailoverReplayed, FailoverReplayDropped, LossSteered, BulkDuplicates, BulkDupSkipped, ParitySent, FlowsPinned, FastReroutes, PinSpills, HeavyStriped uint64
+	PayloadPackets, PayloadBytes, Copies, StripedPackets, PriorityCopies, TCPControlPackets, WireLimited, SocketErrors, RepairCopies, RepairRequests, RepairUnavailableSent, RepairExhausted, RepairNANotCached, RepairNAAged, RepairNAAttempts, RepairThrottled, MTUNoFit, FailoverSuspected, FailoverRecovered, FailoverReplayed, FailoverReplayDropped, LossSteered, BulkDuplicates, BulkDupSkipped, ParitySent, FlowsPinned, FastReroutes, PinSpills, HeavyStriped uint64
 	// Selective-acknowledgement loss handling: frames seen lost on a path, answered by an
 	// immediate resend, held back because a sibling copy may still arrive, or not
 	// recoverable (no cached payload: UDP, or too old).
@@ -332,7 +332,15 @@ func (s *Sender) Controls(result ReceiveResult, now time.Time, writer DatagramWr
 	}
 	for i, key := range result.Repairs {
 		cached := s.repairs[key]
-		if cached == nil || now.Sub(cached.at) >= time.Second || cached.attempts >= repairAttempts {
+		if cached == nil || now.Sub(cached.at) >= s.repairLife() || cached.attempts >= repairAttempts {
+			switch {
+			case cached == nil:
+				s.stats.RepairNANotCached++
+			case now.Sub(cached.at) >= s.repairLife():
+				s.stats.RepairNAAged++
+			default:
+				s.stats.RepairNAAttempts++
+			}
 			// Tell the requester to stop waiting: one answer per request (a
 			// key already queued for repair is not answered).
 			if s.repairRequests[key] == nil && i < len(result.RepairPaths) {
@@ -350,7 +358,7 @@ func (s *Sender) Controls(result ReceiveResult, now time.Time, writer DatagramWr
 		if s.repairRequests[key] == nil {
 			s.repairRequests[key] = s.requestOrder.PushBack(key)
 		}
-		if len(s.repairRequests) > 512 {
+		if len(s.repairRequests) > 4096 {
 			oldest := s.requestOrder.Front()
 			delete(s.repairRequests, oldest.Value.(MissingPacket))
 			s.requestOrder.Remove(oldest)

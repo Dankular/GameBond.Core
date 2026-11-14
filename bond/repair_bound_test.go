@@ -20,8 +20,8 @@ func TestRepairTokensRefillAndCap(t *testing.T) {
 	for s.takeRepairToken(later) {
 		n++
 	}
-	if n < 295 || n > 305 {
-		t.Fatalf("refill gave %d, want about 300", n)
+	if want := int(repairRate * 0.1); n < want*98/100 || n > want*102/100 {
+		t.Fatalf("refill gave %d, want about %d", n, want)
 	}
 	n = 0
 	for s.takeRepairToken(later.Add(time.Hour)) {

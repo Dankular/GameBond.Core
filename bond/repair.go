@@ -33,19 +33,19 @@ type askedRepair struct {
 // a burst of loss: holes then waited out the reorder deadline and were skipped,
 // which TCP reads as loss.
 const (
-	repairCacheMax = 16384
+	repairCacheMax = 131072 // ~170 MB at full-size packets; hardware is not the limit
 	repairBatch    = 16
 	// A hole is asked for up to repairAttempts times. Each ask goes out on every
 	// ready path, and the answering copy prefers a path other than the one that last
 	// carried the packet, so one lossy link cannot swallow both the request and the
 	// answer.
-	repairAttempts   = 4
+	repairAttempts   = 8
 	repairOriginBias = 0.015 // seconds added to the path that last carried the packet
 	// Bounded ARQ: a resend happens only when SACK (or the tail probe) shows a frame was lost
 	// or the peer asks, at most repairAttempts times, and repairs as a whole are limited to a
 	// rate and burst so a loss storm cannot turn into a repair storm. There is no age timer.
-	repairRate  = 3000. // resent packets per second
-	repairBurst = 512.
+	repairRate  = 30000. // resent packets per second
+	repairBurst = 4096.
 )
 
 func repairable(packet []byte) bool {
@@ -81,7 +81,7 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 	}
 	for s.askedOrder.Len() > 0 {
 		old := s.askedOrder.Front().Value.(*askedRepair)
-		if now.Sub(old.at) < time.Second && len(s.asked) <= 2048 {
+		if now.Sub(old.at) < 5*time.Second && len(s.asked) <= 16384 {
 			break
 		}
 		delete(s.asked, old.key)
@@ -236,7 +236,7 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 // outlive the suspicion delay.
 func (s *Sender) repairLife() time.Duration {
 	if s.failover {
-		return 3 * time.Second
+		return 8 * time.Second
 	}
-	return time.Second
+	return 5 * time.Second
 }

@@ -54,14 +54,14 @@ func TestRepairRetainsFlowSequenceUsesFreshNonceAndStopsAfterFour(t *testing.T) 
 			t.Fatal("repair reused nonce or changed inner packet", err)
 		}
 	}
-	s.Maintenance(f.now.Add(time.Second), writer)
+	s.Maintenance(f.now.Add(s.repairLife()+time.Second), writer)
 	if len(s.repairs) != 0 {
 		t.Fatal("repair cache did not expire")
 	}
 }
 func TestReceiveHolesRequestBoundedTCPRepairsWithoutBlockingUrgent(t *testing.T) {
 	f, s, a := senderFixture(t, 1)
-	f.r.reorder.config.Timeout = 200 * time.Millisecond
+	f.r.reorder.config.Timeout = 1500 * time.Millisecond
 	f.receive(t, Striped, stripe(77, 1, 1, tcpPacket("later")), a[0])
 	var requests []Packet
 	writer := func(d Datagram) error {
@@ -72,8 +72,9 @@ func TestReceiveHolesRequestBoundedTCPRepairsWithoutBlockingUrgent(t *testing.T)
 		requests = append(requests, packet)
 		return nil
 	}
-	for _, at := range []time.Duration{16, 60, 110, 160, 210} {
-		if err := s.Maintenance(f.now.Add(at*time.Millisecond), writer); err != nil {
+	// Past the attempt limit, spaced beyond the ask gap, so the bound is what stops the asking.
+	for i := 0; i <= repairAttempts+2; i++ {
+		if err := s.Maintenance(f.now.Add(time.Duration(16+i*90)*time.Millisecond), writer); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -91,7 +92,7 @@ func TestReceiveHolesRequestBoundedTCPRepairsWithoutBlockingUrgent(t *testing.T)
 	}
 	// UDP/game packets never trigger this TCP repair mechanism.
 	f.receive(t, Striped, stripe(88, 1, 1, []byte("not TCP")), a[0])
-	s.Maintenance(f.now.Add(250*time.Millisecond), writer)
+	s.Maintenance(f.now.Add(time.Duration(16+(repairAttempts+3)*90)*time.Millisecond), writer)
 	if len(requests) != repairAttempts {
 		t.Fatal("UDP was retransmitted as TCP")
 	}
