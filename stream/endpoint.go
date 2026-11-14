@@ -402,3 +402,10 @@ func (s *Stream) closedNow() bool {
 	defer s.ep.mu.Unlock()
 	return s.c.Done()
 }
+
+// Congestion snapshots what the controller has measured about the path.
+func (s *Stream) Congestion() Congestion {
+	s.ep.mu.Lock()
+	defer s.ep.mu.Unlock()
+	return s.c.Congestion()
+}

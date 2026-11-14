@@ -10,8 +10,9 @@
 //     reorder window (the gap between the slowest and fastest link), never by
 //     a duplicate-ACK count, so packets that merely took the slower link are not
 //     retransmitted and do not collapse a window.
-//   - Congestion control is not here: the transport's per-link budgets pace
-//     sends (Poll only emits what Allow permits), so the stream is one
+//   - Congestion control is a model of the path (cc.go): bottleneck bandwidth and
+//     propagation delay are measured, sends are paced to them, and the transport's
+//     per-link budgets (Allow) further gate each packet. The stream is one
 //     connection over all links.
 package stream
 
@@ -88,6 +89,12 @@ type sentPacket struct {
 	fin      bool
 	at       time.Time
 	lost     bool
+
+	// Delivery-rate sampling state when this packet was sent.
+	delivered   uint64
+	deliveredAt time.Time
+	firstSentAt time.Time
+	appLimited  bool
 }
 
 type chunk struct {
@@ -116,20 +123,27 @@ type Conn struct {
 	retx           []chunk
 	acked          []span // acknowledged stream ranges above sndBase (sorted, disjoint)
 	peerWindow     uint64
+	peerRcvNxt     uint64 // the peer's cumulative acknowledgement: the window is measured from here
 	largestAck     uint64
 	hasAck         bool
 	lastAckSent    time.Time
 	timeouts       int
-	cwnd, ssthresh int
 	paceNext       time.Time
-	recoveryPN     uint64
+	probes         int // retransmissions allowed past the window after a timeout
+	lastPoll       time.Time
+	pollGap        time.Duration // how far apart the caller really polls: the pacer must bridge it
+
+	// Congestion control and delivery-rate sampling.
+	cc              *congestion
+	delivered       uint64    // stream bytes known to have reached the peer
+	deliveredAt     time.Time // when the last of them was acknowledged
+	firstSentAt     time.Time // send time of the packet that began the current acknowledgement flight
+	appLimitedUntil uint64    // delivered mark below which samples are app-limited
 
 	// RTT
-	srtt, rttvar, minRTT time.Duration
-	minNext              time.Duration
-	flightBytes          int // bytes sent and neither acknowledged, dropped nor declared lost
-	minAt                time.Time
-	hasRTT               bool
+	srtt, rttvar time.Duration
+	flightBytes  int // bytes sent and neither acknowledged, dropped nor declared lost
+	hasRTT       bool
 
 	// Receive side.
 	rcvNxt    uint64
@@ -164,7 +178,7 @@ type Stats struct {
 // New returns a connection.
 func New(cfg Config) *Conn {
 	cfg.defaults()
-	return &Conn{cwnd: 32 * cfg.MSS, ssthresh: 1 << 30, cfg: cfg, inflight: make(map[uint64]*sentPacket), oooData: make(map[uint64][]byte), peerWindow: uint64(cfg.RecvWindow), srtt: cfg.InitialRTT, rttvar: cfg.InitialRTT / 2}
+	return &Conn{cc: newCongestion(cfg.MSS, cfg.InitialRTT), cfg: cfg, inflight: make(map[uint64]*sentPacket), oooData: make(map[uint64][]byte), peerWindow: uint64(cfg.RecvWindow), srtt: cfg.InitialRTT, rttvar: cfg.InitialRTT / 2}
 }
 
 // Write queues bytes and reports how many were accepted (the send buffer can
@@ -242,8 +256,12 @@ func (c *Conn) Done() bool {
 	return c.finQueued && c.finAcked && c.Finished()
 }
 
+// recvWindow is how far past rcvNxt the peer may send. It is measured from rcvNxt, so data
+// already held out of order sits inside it: counting it again would shrink the window by the
+// size of a hole's shadow, and after one loss a long path would stall until the hole filled.
+// Only bytes the application has not yet read take space away.
 func (c *Conn) recvWindow() uint64 {
-	used := len(c.readBuf) + c.oooBytes
+	used := len(c.readBuf)
 	if used >= c.cfg.RecvWindow {
 		return 0
 	}
@@ -473,6 +491,7 @@ func (c *Conn) onAck(b []byte, now time.Time) ([]byte, error) {
 		ranges = append(ranges, span{lo, hi})
 	}
 	c.peerWindow = uint64(window)
+	c.peerRcvNxt = max(c.peerRcvNxt, rcvNxt)
 	newly := false
 	var sample time.Duration
 	var got []*sentPacket
@@ -502,16 +521,32 @@ func (c *Conn) onAck(b []byte, now time.Time) ([]byte, error) {
 	if sample > 0 {
 		c.rttSample(sample)
 	}
-	// Account for the acknowledged packets before the cumulative ack drops them.
+	// Account for the acknowledged packets before the cumulative ack drops them. Bytes count
+	// as delivered once, however many copies of a range were sent, so a retransmission that
+	// turns out unnecessary does not inflate the rate.
+	var best *sentPacket
+	newBytes := 0
 	for _, p := range got {
 		if p.lost {
 			c.Stats.SpuriousRetx++
 		}
-		c.grow(int(p.end - p.off))
+		fresh := 0
+		if p.end > p.off && !c.isAcked(p.off, p.end) {
+			fresh = int(p.end - p.off)
+		}
+		c.delivered += uint64(fresh)
+		c.deliveredAt = now
+		newBytes += fresh
+		if best == nil || p.at.After(best.at) || (p.at.Equal(best.at) && p.pn > best.pn) {
+			best = p // the newest acknowledged packet describes the flight best
+		}
 		c.markAcked(p.off, p.end)
 		if p.fin {
 			c.finAcked = true
 		}
+	}
+	if best != nil {
+		c.cc.onAck(now, c.rateOf(best, now, sample), c.delivered, newBytes, c.flightBytes)
 	}
 	if rcvNxt > c.sndBase {
 		c.advanceBase(rcvNxt)
@@ -526,44 +561,44 @@ func (c *Conn) onAck(b []byte, now time.Time) ([]byte, error) {
 	return b, nil
 }
 
-func (c *Conn) grow(acked int) {
-	// A standing queue in the transport (RTT well above the floor, beyond what
-	// the slower link explains) means the window is past the path's capacity:
-	// shrink it gently rather than wait for the queue to overflow into loss.
-	// Only a sustained, large inflation counts (twice the recent floor): a fast
-	// link's jitter and the other path's ordinary delay must not pin the window.
-	if c.hasRTT && c.srtt > 2*c.minRTT+c.reorderWindow()+30*time.Millisecond {
-		c.cwnd = max(c.cwnd-acked/16, 32*c.cfg.MSS)
-		c.ssthresh = min(c.ssthresh, c.cwnd)
-		return
+// rateOf is the delivery-rate sample for an acknowledgement whose newest packet is p: the
+// bytes delivered since p was sent, over the longer of how long its flight took to send and
+// how long it took to acknowledge. An interval shorter than the propagation delay cannot be
+// a real measurement of the path, so such a sample is marked invalid.
+func (c *Conn) rateOf(p *sentPacket, now time.Time, rtt time.Duration) rateSample {
+	rs := rateSample{rtt: rtt, priorDelivered: p.delivered, appLimited: p.appLimited}
+	interval := max(p.at.Sub(p.firstSentAt), now.Sub(p.deliveredAt))
+	c.firstSentAt = p.at
+	if interval > 0 && interval >= c.cc.rtProp && c.delivered > p.delivered {
+		rs.rate = float64(c.delivered-p.delivered) / interval.Seconds()
+		rs.valid = true
 	}
-	if c.cwnd < c.ssthresh {
-		c.cwnd += acked
-		return
-	}
-	c.cwnd += acked / 4 // probe 25% per round trip
+	return rs
 }
 
-// Cwnd is the congestion window in bytes.
-func (c *Conn) Cwnd() int { return c.cwnd }
+// Cwnd is the in-flight cap in bytes.
+func (c *Conn) Cwnd() int { return c.cc.window() }
+
+// Congestion reports what the controller has measured and how it is pacing.
+type Congestion struct {
+	Mode         string
+	BtlBwBps     float64 // bytes/s
+	RTProp       time.Duration
+	PacingBps    float64
+	InflightHi   int
+	Conservation bool
+}
+
+// Congestion snapshots the controller.
+func (c *Conn) Congestion() Congestion {
+	g := c.cc
+	return Congestion{g.mode.String(), g.btlBw, g.rtProp, g.pacingRate(), g.inflightHi, g.conservation}
+}
 
 func (c *Conn) rttSample(s time.Duration) {
 	if !c.hasRTT {
-		c.srtt, c.rttvar, c.minRTT, c.hasRTT = s, s/2, s, true
+		c.srtt, c.rttvar, c.hasRTT = s, s/2, true
 		return
-	}
-	// minRTT is the floor over roughly the last 10-20 s, so a route change that
-	// raises the base delay is not mistaken for a standing queue forever.
-	if s < c.minRTT {
-		c.minRTT = s
-	}
-	if c.minAt.IsZero() {
-		c.minAt = time.Now()
-	} else if time.Since(c.minAt) > 10*time.Second {
-		c.minRTT, c.minAt = max(c.minNext, s), time.Now()
-		c.minNext = s
-	} else if c.minNext == 0 || s < c.minNext {
-		c.minNext = s
 	}
 	d := c.srtt - s
 	if d < 0 {
@@ -678,22 +713,19 @@ func (c *Conn) detectLoss(now time.Time) {
 			continue
 		}
 		if pn < c.largestAck && now.Sub(p.at) > c.srtt+window {
-			c.markLost(p)
+			c.markLost(p, now)
 		}
 	}
 	c.gcOrder()
 }
 
-func (c *Conn) markLost(p *sentPacket) {
+func (c *Conn) markLost(p *sentPacket, now time.Time) {
 	if !p.lost {
 		c.flightBytes -= int(p.end - p.off)
+		// A loss is a signal only in aggregate (cc.go): this just feeds the count.
+		c.cc.onLoss(int(p.end-p.off), c.flightBytes)
 	}
 	p.lost = true
-	if p.pn >= c.recoveryPN { // one reduction per round trip of losses
-		c.cwnd = max(c.cwnd*85/100, 4*c.cfg.MSS)
-		c.ssthresh = c.cwnd
-		c.recoveryPN = c.nextPN
-	}
 	if !c.isAcked(p.off, p.end) || p.fin && !c.finAcked {
 		c.retx = append(c.retx, chunk{p.off, p.end, p.fin})
 	}
@@ -736,20 +768,26 @@ func (c *Conn) Poll(now time.Time, out *[][]byte) time.Time {
 		if !oldest.IsZero() {
 			if now.Sub(oldest) >= c.rto() {
 				c.timeouts++
-				if c.nextPN > c.recoveryPN { // one reduction per window, not one per timeout
-					c.ssthresh = max(c.cwnd*7/10, 8*c.cfg.MSS)
-					c.cwnd, c.recoveryPN = c.ssthresh, c.nextPN
-				}
 				c.Stats.Timeouts++
+				// The first timeouts send probes: the oldest few packets again, outside the window
+				// (which is full of what is being waited for). Only silence that persists treats the
+				// whole flight as lost; a delay spike answers the probes and the ordinary loss rule
+				// then resends exactly what is missing.
+				limit := 2
+				if c.timeouts >= ccPersistentTimeouts {
+					limit = len(c.inflight)
+				}
 				marked := 0
-				for _, pn := range c.order { // probe with the oldest few, not the whole flight
+				for _, pn := range c.order {
 					if p := c.inflight[pn]; p != nil && !p.lost {
-						c.markLost(p)
-						if marked++; marked >= 4 {
+						c.markLost(p, now)
+						if marked++; marked >= limit {
 							break
 						}
 					}
 				}
+				c.probes = 2
+				c.cc.onTimeout(c.timeouts)
 				if c.timeouts > c.cfg.MaxRetxTries {
 					c.closedErr = errors.New("stream: peer unreachable")
 					return wake
@@ -761,15 +799,27 @@ func (c *Conn) Poll(now time.Time, out *[][]byte) time.Time {
 	}
 	allow := c.cfg.Allow
 	flight := c.InFlight()
-	// Pace at 1.25 x cwnd per smoothed RTT so a window is never dumped into the
-	// transport as one burst (which overflows its queues and looks like loss).
-	base := c.srtt
-	if c.hasRTT && base > 2*c.minRTT {
-		base = 2 * c.minRTT
+	cwnd := c.cc.window()
+	// Pace at the rate the path was measured to carry, so a window is never dumped into the
+	// transport as one burst (which overflows its queues and looks like loss). The credit for
+	// a few milliseconds lets a coarse timer still reach the rate.
+	rate := c.cc.pacingRate()
+	if !c.lastPoll.IsZero() {
+		if gap := now.Sub(c.lastPoll); gap > 0 && gap < 100*time.Millisecond {
+			if gap > c.pollGap {
+				c.pollGap = gap
+			} else {
+				c.pollGap -= (c.pollGap - gap) / 16
+			}
+		}
 	}
-	rate := 1.25 * float64(c.cwnd) / math.Max(base.Seconds(), 0.005) // bytes/s
-	if c.paceNext.Before(now.Add(-4 * time.Millisecond)) {
-		c.paceNext = now.Add(-4 * time.Millisecond)
+	c.lastPoll = now
+	// Credit for the time between polls, so a coarse timer (Windows can fall back to 15 ms)
+	// still reaches the rate instead of losing the remainder of every tick.
+	burst := max(time.Duration(float64(2*c.cfg.MSS)/rate*float64(time.Second)), 4*time.Millisecond, c.pollGap*5/4)
+	burst = min(burst, 30*time.Millisecond)
+	if c.paceNext.Before(now.Add(-burst)) {
+		c.paceNext = now.Add(-burst)
 	}
 	paced := func(size int) bool {
 		if c.paceNext.After(now) {
@@ -808,7 +858,7 @@ func (c *Conn) Poll(now time.Time, out *[][]byte) time.Time {
 			take.end = take.off + uint64(c.cfg.MSS)
 			take.fin = false
 		}
-		if flight >= c.cwnd {
+		if flight >= cwnd && c.probes == 0 {
 			soon(now.Add(time.Millisecond))
 			break
 		}
@@ -818,6 +868,9 @@ func (c *Conn) Poll(now time.Time, out *[][]byte) time.Time {
 			break
 		}
 		flight += int(take.end - take.off)
+		if c.probes > 0 {
+			c.probes--
+		}
 		c.Stats.Retransmits++
 		if take.end == ch.end {
 			c.retx = c.retx[1:]
@@ -828,7 +881,12 @@ func (c *Conn) Poll(now time.Time, out *[][]byte) time.Time {
 	// New data, bounded by the peer's window.
 	for {
 		avail := c.sndBase + uint64(len(c.sndBuf)) - c.sndNxt
-		limit := c.sndBase + c.peerWindow
+		if avail == 0 && !c.finQueued && len(c.retx) == 0 && flight < cwnd {
+			// Nothing left to send and room to send it: rates measured now say how fast the
+			// application writes, not what the path can carry.
+			c.appLimitedUntil = max(c.appLimitedUntil, c.delivered+uint64(flight)+1)
+		}
+		limit := max(c.sndBase, c.peerRcvNxt) + c.peerWindow
 		if c.sndNxt >= limit {
 			avail = 0
 		} else if avail > limit-c.sndNxt {
@@ -843,7 +901,7 @@ func (c *Conn) Poll(now time.Time, out *[][]byte) time.Time {
 			n = uint64(c.cfg.MSS)
 			fin = false
 		}
-		if flight >= c.cwnd {
+		if flight >= cwnd {
 			soon(now.Add(time.Millisecond))
 			break
 		}
@@ -889,6 +947,12 @@ func (c *Conn) dataPacket(ch chunk, now time.Time) ([]byte, *sentPacket) {
 	pn := c.nextPN
 	c.nextPN++
 	p := &sentPacket{pn: pn, off: ch.off, end: ch.end, fin: ch.fin, at: now}
+	if c.flightBytes == 0 {
+		// Nothing outstanding: a new acknowledgement flight starts here.
+		c.firstSentAt, c.deliveredAt = now, now
+	}
+	p.delivered, p.deliveredAt, p.firstSentAt = c.delivered, c.deliveredAt, c.firstSentAt
+	p.appLimited = c.delivered < c.appLimitedUntil
 	c.inflight[pn] = p
 	c.flightBytes += int(p.end - p.off)
 	c.order = append(c.order, pn)
