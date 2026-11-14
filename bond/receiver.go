@@ -49,6 +49,7 @@ type ReceiverStats struct {
 	Authenticated, AuthenticationErrors, Malformed, Duplicates, FloorDrops, HandshakeRejected uint64
 	PayloadPackets, PayloadBytes, WireRX, WireTX, SendErrors                                  uint64
 	ReplayTooOld, ReplayTooFar                                                                uint64
+	IgnoredWhileRestarting uint64
 	PeerRestarts, PathMigrations                                                              uint64
 	// GapFeedback counts feedback frames sent at once because a frame arrived ahead of a missing one.
 	GapFeedback uint64
@@ -377,6 +378,13 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 		}
 	}
 	if (p == nil && migrated == nil) || (p != nil && !p.ready) {
+		if r.role == "client" && p != nil {
+			// Genuine server traffic on a link whose handshake this client has
+			// restarted: unusable until the new handshake ends, and the other
+			// link carries a copy. Not a protocol rejection.
+			r.stats.IgnoredWhileRestarting++
+			return out, nil
+		}
 		r.stats.HandshakeRejected++
 		return out, nil
 	}
