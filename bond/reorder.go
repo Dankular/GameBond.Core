@@ -263,7 +263,7 @@ func (r *Reorder) Push(id, number uint64, payload []byte, now time.Time) [][]byt
 		for len(f.numbers) > 0 && f.numbers[0] < number {
 			r.flush(f, &out, true)
 		}
-		if number > f.expected && number-f.expected <= maxHoleSpan && ipProto(payload) == 6 {
+		if number > f.expected && number-f.expected <= maxHoleSpan {
 			if len(f.holes) >= maxHoles {
 				f.holes = f.holes[1:]
 			}

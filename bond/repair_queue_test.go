@@ -90,11 +90,11 @@ func TestReceiveHolesRequestBoundedTCPRepairsWithoutBlockingUrgent(t *testing.T)
 	if len(out.Deliver) != 1 {
 		t.Fatal("repair hole blocked urgent DATA")
 	}
-	// UDP/game packets never trigger this TCP repair mechanism.
-	f.receive(t, Striped, stripe(88, 1, 1, []byte("not TCP")), a[0])
+	// A lost UDP packet is asked for as well (see TestLostUDPPacketIsAskedForLikeTCP).
+	f.receive(t, Striped, stripe(88, 1, 1, udpPacket(5000, 6000, 2)), a[0])
 	s.Maintenance(f.now.Add(time.Duration(16+(repairAttempts+3)*90)*time.Millisecond), writer)
-	if len(requests) != repairAttempts {
-		t.Fatal("UDP was retransmitted as TCP")
+	if len(requests) != repairAttempts+1 {
+		t.Fatalf("UDP hole not asked for: %d requests", len(requests))
 	}
 }
 func TestTransmitQueueAdmitsUrgentDuringBulkPressureAndOwnsBuffers(t *testing.T) {
@@ -238,5 +238,24 @@ func TestRepairRequestGoesOutOnEveryReadyPath(t *testing.T) {
 	}
 	if s.Stats().RepairRequests != 1 {
 		t.Fatalf("one hole counted as %d requests", s.Stats().RepairRequests)
+	}
+}
+
+func TestLostUDPPacketIsAskedForLikeTCP(t *testing.T) {
+	f, s, a := senderFixture(t, 2)
+	f.r.reorder.config.Timeout = 200 * time.Millisecond
+	f.receive(t, Striped, stripe(78, 1, 1, udpPacket(5000, 6000, 1)), a[0])
+	asked := 0
+	writer := func(d Datagram) error {
+		if p, err := f.c.Decode(d.Frame); err == nil && p.Header.Kind == Repair {
+			asked++
+		}
+		return nil
+	}
+	if err := s.Maintenance(f.now.Add(20*time.Millisecond), writer); err != nil {
+		t.Fatal(err)
+	}
+	if asked == 0 || s.Stats().RepairRequests != 1 {
+		t.Fatalf("lost UDP packet not asked for: %d frames, %+v", asked, s.Stats())
 	}
 }

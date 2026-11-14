@@ -135,7 +135,9 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 	}
 	if s.nextRepairRequest.IsZero() || !now.Before(s.nextRepairRequest) {
 		delay := time.Duration(math.Max(.012, (maximum-minimum)/2+jitter) * float64(time.Second))
-		missing := s.r.reorder.Missing(now, delay, repairBatch, repairable)
+		// UDP holes are asked for too: a lost video or QUIC packet is worth a resend, and the
+			// peer answers late ones with an RepairNA, so asking costs one small frame.
+			missing := s.r.reorder.Missing(now, delay, repairBatch, nil)
 		if len(missing) > 0 {
 			s.nextRepairRequest = now.Add(5 * time.Millisecond)
 		}
