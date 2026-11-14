@@ -56,6 +56,8 @@ type SenderStats struct {
 	RecoveryPeak10ms uint64
 	// RecoveryEscapes counts times a repair had been held the full limit and was let through.
 	RecoveryEscapes uint64
+	// DeadPathLost counts frames on a path that stopped answering, declared lost at once.
+	DeadPathLost uint64
 	TailProbed, ParityRSSent                          uint64
 }
 

@@ -82,6 +82,12 @@ func (s *Sender) failoverStep(now time.Time, writer DatagramWriter) error {
 			p.suspect = true
 			s.stats.FailoverSuspected++
 			s.queueReplays(p, now)
+			// Its frames will never be reported by the peer: count them lost now, so a
+			// packet whose other copy was lost too is resent instead of waiting for them.
+			for _, key := range p.budget.LostPending() {
+				s.stats.DeadPathLost++
+				s.sackLoss(key, now)
+			}
 		case !suspect && p.suspect:
 			p.suspect = false
 			s.stats.FailoverRecovered++

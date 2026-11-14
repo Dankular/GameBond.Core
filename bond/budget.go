@@ -326,6 +326,25 @@ func (b *Budget) Sack(base uint64, bits []byte) []MissingPacket {
 	return lost
 }
 
+// LostPending declares every still-unacknowledged keyed frame on this path lost and
+// returns the flow packets they carried. It is for a path that stopped answering: its
+// frames will never be reported by the selective acknowledgement, so without this a
+// packet whose other copy was also lost would wait for them forever.
+func (b *Budget) LostPending() []MissingPacket {
+	var lost []MissingPacket
+	for e := b.order.Front(); e != nil; e = e.Next() {
+		p := e.Value.(budgetPending)
+		if p.lost || !p.keyed {
+			continue
+		}
+		p.lost = true
+		e.Value = p
+		b.sackLost++
+		lost = append(lost, p.key)
+	}
+	return lost
+}
+
 // tailProbeLimit bounds how many silent frames one call can declare lost.
 const tailProbeLimit = 64
 
