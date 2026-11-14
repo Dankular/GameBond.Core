@@ -98,16 +98,32 @@ func ParseFrame(frame []byte) (FrameInfo, error) {
 
 func isDHCP(a, b uint16) bool { return (a == 67 || a == 68) && (b == 67 || b == 68) }
 
-// classifyFrame gives an Ethernet frame its queue policy: control frames are priority copies,
+// ClassifyFrame gives an Ethernet frame its queue policy: control frames are priority copies,
 // an IPv4 frame is classified by its packet exactly as it would be without L2 carriage, and
-// everything else is bulk keyed by its MAC pair so it still keeps its order.
+// everything else is bulk keyed by its MAC pair so it still keeps its order. It is shared by the
+// session (server) and the client's own queue so both ends treat a frame the same way.
+func (c *Classifier) ClassifyFrame(frame []byte, now time.Time) (Classification, FrameInfo, error) {
+	info, err := ParseFrame(frame)
+	if err != nil {
+		return Classification{}, info, err
+	}
+	if info.Control {
+		return Classification{Info: IPv4Info{Flow: "l2:ctl", DSCP: l2ControlTag}, Tag: l2ControlTag, Policy: c.policyFor(l2ControlTag), Reason: "l2_control"}, info, nil
+	}
+	if info.IP != nil {
+		return c.Classify(*info.IP, now), info, nil
+	}
+	flow := "l2:" + macPair(info.Src, info.Dst)
+	return Classification{Info: IPv4Info{Flow: flow}, Tag: 0, Policy: c.policyFor(0), Reason: "l2_other"}, info, nil
+}
+
 func (s *Session) classifyFrame(payload []byte, now time.Time) (Classification, bool) {
 	frame, _ := UnwrapFrame(payload)
 	if len(frame) > s.options.L2MTU() {
 		s.stats.L2Oversize++
 		return Classification{}, false
 	}
-	info, err := ParseFrame(frame)
+	c, info, err := s.classifier.ClassifyFrame(frame, now)
 	if err != nil {
 		s.stats.Malformed++
 		return Classification{}, false
@@ -115,14 +131,8 @@ func (s *Session) classifyFrame(payload []byte, now time.Time) (Classification, 
 	s.stats.L2Frames++
 	if info.Control {
 		s.stats.L2Control++
-		return Classification{Info: IPv4Info{Flow: "l2:ctl", DSCP: l2ControlTag}, Tag: l2ControlTag, Policy: s.classifier.policyFor(l2ControlTag), Reason: "l2_control"}, true
 	}
-	if info.IP != nil {
-		c := s.classifier.Classify(*info.IP, now)
-		return c, true
-	}
-	flow := "l2:" + macPair(info.Src, info.Dst)
-	return Classification{Info: IPv4Info{Flow: flow}, Tag: 0, Policy: s.classifier.policyFor(0), Reason: "l2_other"}, true
+	return c, true
 }
 
 func macPair(a, b [6]byte) string {
