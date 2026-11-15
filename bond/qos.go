@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -74,14 +75,18 @@ type Classifier struct {
 	priorityHosts            map[[4]byte]bool
 	hostMax                  int // largest device UDP packet that is game-priority
 	flowOrder, fragmentOrder list.List
+	// mu serialises the caches and the host list. The L3 tunnel path and the L2 bridge classify from
+	// different goroutines through one Classifier; the maps and lists below are not safe unshared, and an
+	// unlocked race left a list element with a nil value and crashed the client in expireLearned.
+	mu sync.Mutex
 }
 
 // SetPriorityHosts makes the UDP traffic of the given hosts (a console behind a
 // LAN adapter) game-priority: such a device uses many unpredictable game and
 // voice ports, so port lists cannot identify it. DNS and QUIC/HTTPS UDP stay
-// ordinary. The classifier is used from one goroutine; call before traffic.
+// ordinary. The classifier is safe for concurrent use.
 // SetPriorityHostMax overrides PriorityHostMaxPacket (0 keeps the default).
-func (c *Classifier) SetPriorityHostMax(n int) { c.hostMax = n }
+func (c *Classifier) SetPriorityHostMax(n int) { c.mu.Lock(); c.hostMax = n; c.mu.Unlock() }
 
 func (c *Classifier) hostLimit() int {
 	if c.hostMax > 0 {
@@ -91,6 +96,8 @@ func (c *Classifier) hostLimit() int {
 }
 
 func (c *Classifier) SetPriorityHosts(hosts []netip.Addr) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.priorityHosts = make(map[[4]byte]bool, len(hosts))
 	for _, h := range hosts {
 		if h.Is4() {
@@ -148,6 +155,8 @@ func NewClassifier(policies map[byte]QueuePolicy, ports []uint16, settings QoSSe
 	return c, nil
 }
 func (c *Classifier) Reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	clear(c.flows)
 	clear(c.fragments)
 	c.flowOrder.Init()
@@ -201,6 +210,8 @@ func (c *Classifier) policyFor(tag byte) QueuePolicy {
 	return policy
 }
 func (c *Classifier) Classify(info IPv4Info, now time.Time) Classification {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	tag, reason := info.DSCP, "dscp"
 	if info.FragmentKey != "" && info.FragmentOffset == 0 {
 		reason = "fragment_first"
