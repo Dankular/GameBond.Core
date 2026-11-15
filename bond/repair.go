@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"encoding/binary"
 	"math"
+	"sort"
 	"time"
 )
 
@@ -239,8 +240,11 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 		}
 		refund := func() { s.repairTokens++ }
 		size := len(cached.payload) + Overhead + 24
-		var target *receivePath
-		bestScore := math.Inf(1)
+		type repairCandidate struct {
+			p     *receivePath
+			score float64
+		}
+		var candidates []repairCandidate
 		for _, p := range s.fitPaths(paths, size) {
 			ready, err := p.budget.ReadyAt(size, timestamp)
 			if err != nil {
@@ -261,16 +265,16 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 			if p == cached.origin {
 				score += repairOriginBias
 			}
-			if score < bestScore {
-				bestScore = score
-				target = p
-			}
+			candidates = append(candidates, repairCandidate{p, score})
 		}
-		if target == nil {
+		if len(candidates) == 0 {
 			refund()
 			s.stats.RepairThrottled++
 			break
 		}
+		sort.Slice(candidates, func(i, j int) bool { return candidates[i].score < candidates[j].score })
+		priorOrigin := cached.origin // the path that carried (and lost) this packet last
+		target := candidates[0].p
 		body := make([]byte, 24+len(cached.payload))
 		binary.BigEndian.PutUint64(body, key.Flow)
 		binary.BigEndian.PutUint64(body[8:], key.Number)
@@ -280,21 +284,56 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 		if err != nil {
 			return err
 		}
-		if s.written(Datagram{Endpoint: target.endpoint, Frame: frame, Local: target.local}, target, now, writer) {
-			sequence := binary.BigEndian.Uint64(frame[37:])
-			target.budget.Sent(sequence, len(frame), timestamp)
-			target.budget.Tag(sequence, key)
-			cached.sent++
-			cached.attempts++
-			cached.origin = target
-			cached.carry(target)
-			s.recoverySpent(target, size+28, now)
-			delete(s.repairRequests, key)
-			s.requestOrder.Remove(e)
-			s.stats.RepairCopies++
-			s.stats.Copies++
-		} else {
+		if !s.written(Datagram{Endpoint: target.endpoint, Frame: frame, Local: target.local}, target, now, writer) {
 			break
+		}
+		sequence := binary.BigEndian.Uint64(frame[37:])
+		target.budget.Sent(sequence, len(frame), timestamp)
+		target.budget.Tag(sequence, key)
+		cached.sent++
+		cached.attempts++
+		cached.origin = target
+		cached.carry(target)
+		s.recoverySpent(target, size+28, now)
+		delete(s.repairRequests, key)
+		s.requestOrder.Remove(e)
+		s.stats.RepairCopies++
+		s.stats.Copies++
+		// A repair answers a packet that was already unlucky once: copy it onto a second path
+		// too, the same redundancy every first-send packet gets (protection.go), so the repair
+		// itself is not a single point of failure if that one chosen line blips right as it
+		// goes out. The second path must not be the one that just lost the packet (priorOrigin):
+		// duplicating onto the path already proven bad for this packet buys nothing. The copy
+		// spends its own repair-rate token, so a quiet link cannot double the wire cost of every
+		// repair, and a failed copy is not fatal: the primary already answered the request.
+		var second *receivePath
+		for _, c := range candidates[1:] {
+			if c.p != priorOrigin {
+				second = c.p
+				break
+			}
+		}
+		if second != nil && s.takeRepairToken(now) {
+			body2 := make([]byte, 24+len(cached.payload))
+			binary.BigEndian.PutUint64(body2, key.Flow)
+			binary.BigEndian.PutUint64(body2[8:], key.Number)
+			binary.BigEndian.PutUint64(body2[16:], second.txEpoch)
+			copy(body2[24:], cached.payload)
+			if frame2, err := s.r.codec.Encode(Striped, body2); err != nil {
+				return err
+			} else if s.written(Datagram{Endpoint: second.endpoint, Frame: frame2, Local: second.local}, second, now, writer) {
+				sequence2 := binary.BigEndian.Uint64(frame2[37:])
+				second.budget.Sent(sequence2, len(frame2), timestamp)
+				second.budget.Tag(sequence2, key)
+				cached.sent++
+				cached.origin = second
+				cached.carry(second)
+				s.recoverySpent(second, size+28, now)
+				s.stats.RepairCopies++
+				s.stats.Copies++
+			} else {
+				s.repairTokens++ // the copy never left; refund its token
+			}
 		}
 	}
 	return nil

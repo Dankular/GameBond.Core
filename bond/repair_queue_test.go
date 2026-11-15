@@ -3,6 +3,7 @@ package bond
 import (
 	"bytes"
 	"encoding/binary"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -59,6 +60,50 @@ func TestRepairRetainsFlowSequenceUsesFreshNonceAndStopsAfterFour(t *testing.T) 
 		t.Fatal("repair cache did not expire")
 	}
 }
+// A repair answer is itself redundancy-worthy: with a third path ready besides the one that
+// lost the packet, the cached payload goes out on two different paths, neither of them the
+// one already proven bad for this packet, so the repair is not a single point of failure the
+// way a single-path answer would be if that one chosen line blipped right as it went out.
+func TestRepairAnswerIsCopiedOntoASecondPathAvoidingTheOneThatLostIt(t *testing.T) {
+	f, s, a := senderFixture(t, 3)
+	var frames []Datagram
+	writer := func(d Datagram) error { frames = append(frames, d); return nil }
+	payload := tcpPacket("application data")
+	if sent, _, err := s.Bulk(payload, "tcp-flow", f.now, writer); !sent || err != nil {
+		t.Fatal(err)
+	}
+	original, _ := f.c.Decode(frames[0].Frame)
+	originEndpoint := frames[0].Endpoint
+	request := append([]byte(nil), original.Payload[:16]...)
+	frames = nil
+	f.now = f.now.Add(20 * time.Millisecond)
+	out := f.receive(t, Repair, request, a[0])
+	s.Controls(out, f.now, writer)
+	if err := s.Maintenance(f.now, writer); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[netip.AddrPort]int{}
+	for _, d := range frames {
+		packet, err := f.c.Decode(d.Frame)
+		if err != nil || packet.Header.Kind != Striped {
+			continue
+		}
+		if !bytes.Equal(packet.Payload[:16], original.Payload[:16]) || !bytes.Equal(packet.Payload[24:], payload) {
+			t.Fatal("repair copy changed inner packet or key")
+		}
+		seen[d.Endpoint]++
+	}
+	if len(seen) != 2 {
+		t.Fatalf("repair answered on %d path(s), want both: %v", len(seen), seen)
+	}
+	if seen[originEndpoint] > 0 {
+		t.Fatalf("repair duplicated onto the path that lost it (%v): %v", originEndpoint, seen)
+	}
+	if s.Stats().RepairCopies != 2 {
+		t.Fatalf("RepairCopies = %d, want 2", s.Stats().RepairCopies)
+	}
+}
+
 func TestReceiveHolesRequestBoundedTCPRepairsWithoutBlockingUrgent(t *testing.T) {
 	f, s, a := senderFixture(t, 1)
 	f.r.reorder.config.Timeout = 1500 * time.Millisecond
