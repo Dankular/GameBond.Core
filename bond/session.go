@@ -9,7 +9,7 @@ type SessionOptions struct {
 	// Version is the build id (git commit) reported to the client.
 	Version string
 	// State, when set, is polled for a word announced to clients ("updating").
-	State   func() string
+	State    func() string
 	MTU      int
 	ClientIP netip.Addr
 	// DeviceIPs are extra tunnel addresses (consoles behind a client LAN adapter)
@@ -30,11 +30,14 @@ type SessionOptions struct {
 	L2 bool
 	// L2FrameMTU is the largest Ethernet frame carried (0 = DefaultL2FrameMTU). Larger frames are
 	// dropped and counted, never fragmented or passed silently.
-	L2FrameMTU int
-	FlowPinning, CoDel                             bool
-	StripeAbove                                    float64
-	ParityRowsMin, ParityRowsMax                   int
-	DelayControl, DelayAssertive                   bool
+	L2FrameMTU                   int
+	FlowPinning, CoDel           bool
+	StripeAbove                  float64
+	ParityRowsMin, ParityRowsMax int
+	DelayControl, DelayAssertive bool
+	// LabMode disables adaptive loss protection and reorder smoothing so
+	// virtual-link impairments remain visible to the application.
+	LabMode bool
 }
 
 func DefaultSessionOptions() SessionOptions {
@@ -95,6 +98,10 @@ func NewSession(key, session []byte, options SessionOptions) (*Session, error) {
 	sender.SetStripeAbove(options.StripeAbove)
 	sender.SetParityRows(options.ParityRowsMin, options.ParityRowsMax)
 	sender.EnableLossTracking(options.LossTracking)
+	sender.SetLabMode(options.LabMode)
+	if options.LabMode {
+		r.SetLabMode(true)
+	}
 	sender.EnableDelayControl(options.DelayControl)
 	sender.SetDelayAssertive(options.DelayAssertive)
 	classifier, err := NewClassifier(options.Policies, options.GamePorts, options.QoS)

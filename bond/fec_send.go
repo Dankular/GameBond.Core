@@ -31,6 +31,9 @@ func (s *Sender) protectionLevel(paths []*receivePath, now time.Time) protection
 	if len(paths) < 2 {
 		return protectNone
 	}
+	if s.labMode {
+		return protectNone
+	}
 	if !s.lossTiered {
 		return protectDuplicate
 	}

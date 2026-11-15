@@ -49,11 +49,11 @@ type ReceiverStats struct {
 	Authenticated, AuthenticationErrors, Malformed, Duplicates, FloorDrops, HandshakeRejected uint64
 	PayloadPackets, PayloadBytes, WireRX, WireTX, SendErrors                                  uint64
 	ReplayTooOld, ReplayTooFar                                                                uint64
-	IgnoredWhileRestarting uint64
+	IgnoredWhileRestarting                                                                    uint64
 	// Datagrams larger than the session limit, kept apart from Malformed so a limit smaller than the peer's
 	// frames is not mistaken for corruption.
-	Oversize, OversizeLargest uint64
-	PeerRestarts, PathMigrations                                                              uint64
+	Oversize, OversizeLargest    uint64
+	PeerRestarts, PathMigrations uint64
 	// GapFeedback counts feedback frames sent at once because a frame arrived ahead of a missing one.
 	GapFeedback uint64
 	// Data frames (replicated game traffic) are delivered at first arrival, so a
@@ -64,11 +64,11 @@ type ReceiverStats struct {
 	PolicyDrops                                                uint64
 	FECParity, FECRecovered, FECRecoveredRS                    uint64
 	ReorderScale, ReorderScaleUDP                              float64
-	BFDSent, BFDReceived, BFDUp, BFDDown, PathStalls         uint64
+	BFDSent, BFDReceived, BFDUp, BFDDown, PathStalls           uint64
 }
 type receivePath struct {
-	recoveryTokens float64 // bytes of recovery traffic this path may send now
-	recoveryAt     time.Time
+	recoveryTokens                   float64 // bytes of recovery traffic this path may send now
+	recoveryAt                       time.Time
 	copySeen, copyMissed, copyLate   uint64
 	copyLagMS                        float64
 	firstWins, lateCopies            uint64
@@ -131,9 +131,9 @@ type pendingProbe struct {
 // must not use it as a production edge server on its own.
 type Receiver struct {
 	role                 string
-	version              string    // this side's build id (commit)
-	peerVersion          string    // the other side's build id, once it has said
-	peerState            string    // the server's announced state ("updating"), client side
+	version              string        // this side's build id (commit)
+	peerVersion          string        // the other side's build id, once it has said
+	peerState            string        // the server's announced state ("updating"), client side
 	stateFn              func() string // server side: current state to announce
 	lastState            string
 	versionAsked         time.Time // last VersionReq sent (client)
@@ -163,6 +163,7 @@ type Receiver struct {
 	expected             []PathKey // see expectedCopyPaths
 	expectedAt           time.Time
 	mtuDiscovery         bool
+	labMode              bool
 	delayControl         bool
 	delayAssertive       bool
 	policyRevisionClient uint64
@@ -171,7 +172,7 @@ type Receiver struct {
 	arrived              func(MissingPacket, time.Time) // told of every flow packet's arrival, before reordering
 	udpScale             float64                        // >= 1: widens the UDP hole wait while UDP keeps arriving after it
 	tuneLateUDP          uint64
-	reorderScale         float64 // >= 1: widens the wait while TCP packets keep arriving after it
+	reorderScale         float64   // >= 1: widens the wait while TCP packets keep arriving after it
 	tuneAt               time.Time // last scale review
 	tuneLate, tuneDeliv  uint64
 }
@@ -190,6 +191,16 @@ func (r *Receiver) SetReorderTimeout(timeout time.Duration) error {
 	r.reorderBase = timeout
 	r.reorder.config.Timeout = timeout
 	return nil
+}
+
+// SetLabMode fixes reordering waits at the configured base timeout instead of
+// smoothing them in response to the virtual link's measured jitter.
+func (r *Receiver) SetLabMode(on bool) {
+	r.labMode = on
+	if on {
+		r.reorder.config.Timeout = r.reorderBase
+		r.reorder.config.UDPTimeout = r.reorderBase
+	}
 }
 
 // SetPathMTUDiscovery enables per-path outbound MTU probing (kinds 14/15).
@@ -666,6 +677,7 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 	}
 	return out, err
 }
+
 // gapFeedbackGap is the least time between feedback frames sent because of a gap. The regular
 // path sends at most every 20 ms; a gap may send sooner, but a striped flow sees the other path's
 // frames as gaps, so it is bounded to 100 frames a second per path.
@@ -814,6 +826,7 @@ func randomNonce() uint64 {
 	rand.Read(b[:])
 	return binary.BigEndian.Uint64(b[:])
 }
+
 // firstArrival remembers when a packet was first delivered, so the later copy on another
 // path can be timed against it (the PRP/802.1CB per-LAN accounting).
 type firstArrival struct {
@@ -858,6 +871,11 @@ func (r *Receiver) accountArrival(p *receivePath, flow, number uint64, duplicate
 const reorderCeiling = .1
 
 func (r *Receiver) updateReorderBudget() {
+	if r.labMode {
+		r.reorder.config.Timeout = r.reorderBase
+		r.reorder.config.UDPTimeout = r.reorderBase
+		return
+	}
 	count := 0
 	minimum, maximum, jitter := math.Inf(1), 0., 0.
 	for _, p := range r.paths {

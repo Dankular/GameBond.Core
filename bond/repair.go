@@ -32,6 +32,7 @@ func (e *repairEntry) carry(p *receivePath) {
 	}
 	e.carried = append(e.carried, p)
 }
+
 type askedRepair struct {
 	key      MissingPacket
 	at       time.Time
@@ -140,6 +141,9 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 		delete(s.asked, old.key)
 		s.askedOrder.Remove(old.order)
 	}
+	if s.labMode {
+		return nil
+	}
 	s.tailProbe(now)
 	s.flushParity(now, writer)
 	s.sendDeferred(now, writer)
@@ -172,8 +176,8 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 	if s.nextRepairRequest.IsZero() || !now.Before(s.nextRepairRequest) {
 		delay := time.Duration(math.Max(.012, (maximum-minimum)/2+jitter) * math.Max(1, s.askScale) * float64(time.Second))
 		// UDP holes are asked for too: a lost video or QUIC packet is worth a resend, and the
-			// peer answers late ones with an RepairNA, so asking costs one small frame.
-			missing := s.r.reorder.Missing(now, delay, repairBatch, nil)
+		// peer answers late ones with an RepairNA, so asking costs one small frame.
+		missing := s.r.reorder.Missing(now, delay, repairBatch, nil)
 		if len(missing) > 0 {
 			s.nextRepairRequest = now.Add(5 * time.Millisecond)
 		}

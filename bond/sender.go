@@ -27,10 +27,10 @@ type sendFlow struct {
 	// flow pinning (pin.go)
 	pin, backup *receivePath
 	// heavy-flow striping (stripe.go)
-	rateAt      time.Time
-	rateBytes   int
-	striped     bool // rate says heavy
-	stripeOn    bool // heavy and every path calm: actually striped
+	rateAt    time.Time
+	rateBytes int
+	striped   bool // rate says heavy
+	stripeOn  bool // heavy and every path calm: actually striped
 }
 
 // Loss steering: measured loss at or above lossSteerRatio, measured within lossSteerLife
@@ -44,7 +44,7 @@ const (
 type SenderStats struct {
 	// Datagrams refused because they exceed the session's datagram limit. Nothing else says so: the caller
 	// gets ErrFrame, so these counters are the only trace of a limit that is smaller than the traffic.
-	RefusedOversize, RefusedOversizeLargest, DatagramLimit uint64
+	RefusedOversize, RefusedOversizeLargest, DatagramLimit                                                                                                                                                                                                                                                                                                                                                                                                             uint64
 	PayloadPackets, PayloadBytes, Copies, StripedPackets, PriorityCopies, TCPControlPackets, WireLimited, SocketErrors, RepairCopies, RepairRequests, RepairUnavailableSent, RepairExhausted, RepairNANotCached, RepairNAAged, RepairNAAttempts, RepairThrottled, MTUNoFit, FailoverSuspected, FailoverRecovered, FailoverReplayed, FailoverReplayDropped, LossSteered, BulkDuplicates, BulkDupSkipped, ParitySent, FlowsPinned, FastReroutes, PinSpills, HeavyStriped uint64
 	// Selective-acknowledgement loss handling: frames seen lost on a path, answered by an
 	// immediate resend, held back because a sibling copy may still arrive, or not
@@ -66,16 +66,16 @@ type SenderStats struct {
 	// RecoveryEscapes counts times a repair had been held the full limit and was let through.
 	RecoveryEscapes uint64
 	// DeadPathLost counts frames on a path that stopped answering, declared lost at once.
-	DeadPathLost uint64
-	TailProbed, ParityRSSent                          uint64
+	DeadPathLost             uint64
+	TailProbed, ParityRSSent uint64
 }
 
 // Sender is the actor-owned transmit half. A caller retries a pending bulk
 // packet at the returned time, servicing Receive/Tick/urgent queues meanwhile.
 type Sender struct {
 	// Scratch space reused by Bulk on every packet (the sender runs on one goroutine).
-	availScratch []*receivePath
-	bodyScratch  []byte
+	availScratch      []*receivePath
+	bodyScratch       []byte
 	r                 *Receiver
 	flows             map[string]*sendFlow
 	parityOpen        map[*sendFlow]struct{} // flows holding a partly filled parity group
@@ -107,6 +107,9 @@ type Sender struct {
 	calmChecked       time.Time
 	calm              bool
 	lossTiered        bool // tests only: loss-driven parity/duplication instead of always duplicating
+	labMode           bool // preserve modeled path loss and delay instead of adaptively masking them
+	stripeBeforeLab   float64
+	failoverBeforeLab bool
 	lossTracking      bool
 	replayQueue       []replayItem // game traffic first
 	replayBulk        []replayItem // TCP segments: TCP resends these itself
@@ -140,6 +143,21 @@ func NewSender(r *Receiver, initial, maximum float64) (*Sender, error) {
 // EnableLossTracking makes replicated priority sends use DATA_COPY so the peer
 // can score each path's copy (Python's loss_tracking option).
 func (s *Sender) EnableLossTracking(on bool) { s.lossTracking = on }
+
+// SetLabMode disables adaptive loss protection and loss-aware path steering so
+// a topology lab can observe the impairment applied by its virtual links.
+func (s *Sender) SetLabMode(on bool) {
+	if on == s.labMode {
+		return
+	}
+	if on {
+		s.stripeBeforeLab, s.failoverBeforeLab = s.stripeMbps, s.failover
+		s.stripeMbps, s.failover = 0, false
+	} else {
+		s.stripeMbps, s.failover = s.stripeBeforeLab, s.failoverBeforeLab
+	}
+	s.labMode = on
+}
 
 // EnableDelayControl lets each path's budget cut its rate when a standing
 // queue builds without loss (config delay_control). Existing paths follow.
@@ -360,55 +378,60 @@ func (s *Sender) cancelProbe(d Datagram) {
 // A denied control write is retried by protocol timers, as in the Python Node.
 func (s *Sender) Controls(result ReceiveResult, now time.Time, writer DatagramWriter) {
 	s.syncPeer()
-	for _, key := range result.Lost {
-		s.sackLoss(key, now)
+	if !s.labMode {
+		for _, key := range result.Lost {
+			s.sackLoss(key, now)
+		}
 	}
-	for i, key := range result.Repairs {
-		cached := s.repairs[key]
-		if cached == nil || now.Sub(cached.at) >= s.repairLife() || cached.attempts >= repairAttempts {
-			switch {
-			case cached == nil:
-				s.stats.RepairNANotCached++
-			case now.Sub(cached.at) >= s.repairLife():
-				s.stats.RepairNAAged++
-			default:
-				s.stats.RepairNAAttempts++
-			}
-			// Tell the requester to stop waiting: one answer per request (a
-			// key already queued for repair is not answered).
-			if s.repairRequests[key] == nil && i < len(result.RepairPaths) {
-				body := make([]byte, 16)
-				binary.BigEndian.PutUint64(body, key.Flow)
-				binary.BigEndian.PutUint64(body[8:], key.Number)
-				at := result.RepairPaths[i]
-				before := len(result.Send)
-				if s.r.write(RepairNA, body, at.Local, at.Remote, &result) == nil && len(result.Send) > before {
-					s.stats.RepairUnavailableSent++
+	if !s.labMode {
+		for i, key := range result.Repairs {
+			cached := s.repairs[key]
+			if cached == nil || now.Sub(cached.at) >= s.repairLife() || cached.attempts >= repairAttempts {
+				switch {
+				case cached == nil:
+					s.stats.RepairNANotCached++
+				case now.Sub(cached.at) >= s.repairLife():
+					s.stats.RepairNAAged++
+				default:
+					s.stats.RepairNAAttempts++
 				}
+				// Tell the requester to stop waiting: one answer per request (a
+				// key already queued for repair is not answered).
+				if s.repairRequests[key] == nil && i < len(result.RepairPaths) {
+					body := make([]byte, 16)
+					binary.BigEndian.PutUint64(body, key.Flow)
+					binary.BigEndian.PutUint64(body[8:], key.Number)
+					at := result.RepairPaths[i]
+					before := len(result.Send)
+					if s.r.write(RepairNA, body, at.Local, at.Remote, &result) == nil && len(result.Send) > before {
+						s.stats.RepairUnavailableSent++
+					}
+				}
+				continue
 			}
-			continue
+			if cached := s.repairs[key]; cached != nil {
+				s.queueRepair(key, cached.payload)
+			} else if s.repairRequests[key] == nil {
+				s.repairRequests[key] = s.requestOrder.PushBack(key)
+			}
+			if len(s.repairRequests) > 4096 {
+				oldest := s.requestOrder.Front()
+				delete(s.repairRequests, oldest.Value.(MissingPacket))
+				s.requestOrder.Remove(oldest)
+			}
 		}
-		if cached := s.repairs[key]; cached != nil {
-			s.queueRepair(key, cached.payload)
-		} else if s.repairRequests[key] == nil {
-			s.repairRequests[key] = s.requestOrder.PushBack(key)
-		}
-		if len(s.repairRequests) > 4096 {
-			oldest := s.requestOrder.Front()
-			delete(s.repairRequests, oldest.Value.(MissingPacket))
-			s.requestOrder.Remove(oldest)
-		}
-	}
-	for _, key := range result.Unavailable {
-		// The peer will never repair this packet: stop asking.
-		if asked := s.asked[key]; asked != nil {
-			asked.at, asked.attempts, asked.exhausted = now, 99, true
+		for _, key := range result.Unavailable {
+			// The peer will never repair this packet: stop asking.
+			if asked := s.asked[key]; asked != nil {
+				asked.at, asked.attempts, asked.exhausted = now, 99, true
+			}
 		}
 	}
 	for _, d := range result.Send {
 		s.written(d, s.r.paths[PathKey{d.Local, d.Endpoint}], now, writer)
 	}
 }
+
 // refuseOversize records a datagram the session's limit refused.
 func (s *Sender) refuseOversize(size int) {
 	s.stats.RefusedOversize++
@@ -423,16 +446,22 @@ func (s *Sender) Urgent(payload []byte, replicate bool, now time.Time, writer Da
 		return 0, ErrFrame
 	}
 	// Priority traffic is copied onto every ready path from its first packet, like bulk.
-	replicate = replicate || !s.lossTiered
+	if s.labMode {
+		replicate = false
+	} else {
+		replicate = replicate || !s.lossTiered
+	}
 	paths := s.fitPaths(s.eligible(now, true), len(payload)+Overhead)
 	sort.Slice(paths, func(i, j int) bool {
 		a, b := paths[i], paths[j]
 		ca, cb := math.Inf(1), math.Inf(1)
-		if a.hasRTT {
-			ca = a.rtt/2 + 2*a.jitter
-		}
-		if b.hasRTT {
-			cb = b.rtt/2 + 2*b.jitter
+		if !s.labMode {
+			if a.hasRTT {
+				ca = a.rtt/2 + 2*a.jitter
+			}
+			if b.hasRTT {
+				cb = b.rtt/2 + 2*b.jitter
+			}
 		}
 		if ca == cb {
 			return a.endpoint.Compare(b.endpoint) < 0
@@ -551,7 +580,7 @@ func (s *Sender) Bulk(payload []byte, key string, now time.Time, writer Datagram
 	// downstream bulk leaves a lossy Starlink link even though the dish hint only
 	// reaches the client. Entry and exit use different thresholds and a minimum hold,
 	// so a noisy reading cannot flap bulk on and off the link.
-	if len(paths) > 1 {
+	if len(paths) > 1 && !s.labMode {
 		var clean []*receivePath
 		for _, p := range paths {
 			if !s.lossSteered(p, s.r.seconds(now)) {
@@ -693,7 +722,9 @@ func (s *Sender) Bulk(payload []byte, key string, now time.Time, writer Datagram
 			p.budget.Sent(sequence, len(frame), timestamp)
 			p.budget.Tag(sequence, MissingPacket{f.id, f.number})
 			p.bulkFinish = math.Max(p.bulkFinish, s.bulkClock) + float64(len(frame)+28)/p.budget.rate
-			s.cacheRepair(MissingPacket{f.id, f.number}, payload, now, p)
+			if !s.labMode {
+				s.cacheRepair(MissingPacket{f.id, f.number}, payload, now, p)
+			}
 			s.bulkProtect(f, f.number, payload, p, now, writer)
 			if f.number == math.MaxUint64 {
 				f.exhausted = true
