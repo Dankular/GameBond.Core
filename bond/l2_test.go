@@ -210,3 +210,33 @@ func TestSwitchRejectsGroupSourceAndMalformed(t *testing.T) {
 		t.Fatalf("unknown port accepted")
 	}
 }
+
+// A session with L2 on must carry the largest bridged frame whatever its L3 MTU is. The limit used to follow
+// the L3 MTU alone (1280 by default), so every frame over 1303 bytes was refused with nothing logged.
+func TestL2SessionLimitAdmitsFullFrames(t *testing.T) {
+	s := l2Session(t, true)
+	need := WrapFrameSize(DefaultL2FrameMTU) + Overhead + 24
+	if s.Receiver.mtu < need {
+		t.Fatalf("datagram limit %d cannot carry a %d-byte frame (needs %d)", s.Receiver.mtu, DefaultL2FrameMTU, need)
+	}
+	off := l2Session(t, false)
+	if off.Receiver.mtu >= need {
+		t.Fatalf("L2 off should keep the L3 limit, got %d", off.Receiver.mtu)
+	}
+}
+
+// A refused oversize datagram is counted, with the size that was refused and the limit that refused it.
+func TestOversizeRefusalIsCounted(t *testing.T) {
+	s := l2Session(t, false)
+	snd := s.Sender
+	big := make([]byte, s.Receiver.mtu)
+	if _, err := snd.Urgent(big, false, time.Now(), func(Datagram) error { return nil }); err != ErrFrame {
+		t.Fatalf("want ErrFrame, got %v", err)
+	}
+	st := snd.stats
+	if st.RefusedOversize != 1 || st.RefusedOversizeLargest != uint64(len(big)+Overhead) || st.DatagramLimit != uint64(s.Receiver.mtu) {
+		t.Fatalf("refusal not recorded: %+v", st)
+	}
+}
+
+func WrapFrameSize(n int) int { return n + 1 }

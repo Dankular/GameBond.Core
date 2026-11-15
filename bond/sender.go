@@ -42,6 +42,9 @@ const (
 )
 
 type SenderStats struct {
+	// Datagrams refused because they exceed the session's datagram limit. Nothing else says so: the caller
+	// gets ErrFrame, so these counters are the only trace of a limit that is smaller than the traffic.
+	RefusedOversize, RefusedOversizeLargest, DatagramLimit uint64
 	PayloadPackets, PayloadBytes, Copies, StripedPackets, PriorityCopies, TCPControlPackets, WireLimited, SocketErrors, RepairCopies, RepairRequests, RepairUnavailableSent, RepairExhausted, RepairNANotCached, RepairNAAged, RepairNAAttempts, RepairThrottled, MTUNoFit, FailoverSuspected, FailoverRecovered, FailoverReplayed, FailoverReplayDropped, LossSteered, BulkDuplicates, BulkDupSkipped, ParitySent, FlowsPinned, FastReroutes, PinSpills, HeavyStriped uint64
 	// Selective-acknowledgement loss handling: frames seen lost on a path, answered by an
 	// immediate resend, held back because a sibling copy may still arrive, or not
@@ -396,9 +399,17 @@ func (s *Sender) Controls(result ReceiveResult, now time.Time, writer DatagramWr
 		s.written(d, s.r.paths[PathKey{d.Local, d.Endpoint}], now, writer)
 	}
 }
+// refuseOversize records a datagram the session's limit refused.
+func (s *Sender) refuseOversize(size int) {
+	s.stats.RefusedOversize++
+	s.stats.RefusedOversizeLargest = max(s.stats.RefusedOversizeLargest, uint64(size))
+	s.stats.DatagramLimit = uint64(s.r.mtu)
+}
+
 func (s *Sender) Urgent(payload []byte, replicate bool, now time.Time, writer DatagramWriter) (int, error) {
 	s.syncPeer()
 	if len(payload)+Overhead > s.r.mtu {
+		s.refuseOversize(len(payload) + Overhead)
 		return 0, ErrFrame
 	}
 	// Priority traffic is copied onto every ready path from its first packet, like bulk.
@@ -485,6 +496,9 @@ func (s *Sender) ResumeBulk(now time.Time) {
 }
 func (s *Sender) Bulk(payload []byte, key string, now time.Time, writer DatagramWriter) (bool, time.Time, error) {
 	s.syncPeer()
+	if len(payload)+Overhead+24 > s.r.mtu {
+		s.refuseOversize(len(payload) + Overhead + 24)
+	}
 	if len(key) > 512 || len(payload)+Overhead+24 > s.r.mtu {
 		return false, now, ErrFrame
 	}

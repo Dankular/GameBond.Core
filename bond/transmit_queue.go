@@ -92,6 +92,9 @@ func (q *TransmitQueue) Enqueue(packet QueuedPacket) bool {
 		packet.Priority = true
 		packet.ClassCapacity = 0
 	}
+	if len(packet.Payload)+Overhead+24 > q.sender.r.mtu {
+		q.sender.refuseOversize(len(packet.Payload) + Overhead + 24)
+	}
 	if packet.Tag > 63 || packet.ClassCapacity < 0 || packet.Expires.IsZero() || len(packet.Flow) > 512 || len(packet.Payload)+Overhead+24 > q.sender.r.mtu || len(packet.Payload) > q.byteLimit {
 		q.stats.Rejected++
 		return false

@@ -50,6 +50,9 @@ type ReceiverStats struct {
 	PayloadPackets, PayloadBytes, WireRX, WireTX, SendErrors                                  uint64
 	ReplayTooOld, ReplayTooFar                                                                uint64
 	IgnoredWhileRestarting uint64
+	// Datagrams larger than the session limit, kept apart from Malformed so a limit smaller than the peer's
+	// frames is not mistaken for corruption.
+	Oversize, OversizeLargest uint64
 	PeerRestarts, PathMigrations                                                              uint64
 	// GapFeedback counts feedback frames sent at once because a frame arrived ahead of a missing one.
 	GapFeedback uint64
@@ -270,7 +273,12 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 	var out ReceiveResult
 	key := PathKey{local, endpoint}
 	timestamp := r.seconds(now)
-	if len(frame) > r.mtu || !endpoint.IsValid() {
+	if len(frame) > r.mtu {
+		r.stats.Oversize++
+		r.stats.OversizeLargest = max(r.stats.OversizeLargest, uint64(len(frame)))
+		return out, nil
+	}
+	if !endpoint.IsValid() {
 		r.stats.Malformed++
 		return out, nil
 	}
