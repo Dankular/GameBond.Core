@@ -73,6 +73,33 @@ func TestPathAccountingCountsWinnersAndSkew(t *testing.T) {
 	}
 }
 
+// A path still inside its post-flap BFD hold-down is resumed but not yet trusted: the catch-up lag
+// of packets racing through it is a recovery artifact, not a measurement of the path's real skew.
+func TestSkewIgnoresLateCopiesDuringHoldDown(t *testing.T) {
+	r := &Receiver{}
+	a, b := &receivePath{}, &receivePath{}
+	t0 := time.Now()
+	b.bfd.goodSince = t0 // mid hold-down: resumed hearing the peer, but bfd.up is still false
+	for n := uint64(0); n < 300; n++ {
+		r.accountArrival(a, 1, n, false, t0)
+		r.accountArrival(b, 1, n, true, t0.Add(80*time.Millisecond))
+	}
+	if b.lateCopies != 300 {
+		t.Fatalf("late copies not counted: %d", b.lateCopies)
+	}
+	if b.skewMS != 0 || b.skewMaxMS != 0 || r.skewSamples != 0 {
+		t.Fatalf("hold-down catch-up counted as skew: skewMS=%.2f skewMaxMS=%.2f samples=%d", b.skewMS, b.skewMaxMS, r.skewSamples)
+	}
+	b.bfd.up = true // hold-down elapsed: the path is trusted again, skew now measures for real
+	for n := uint64(300); n < 600; n++ {
+		r.accountArrival(a, 1, n, false, t0)
+		r.accountArrival(b, 1, n, true, t0.Add(12*time.Millisecond))
+	}
+	if r.skewSamples < 200 {
+		t.Fatalf("skew not measured once trusted: samples=%d", r.skewSamples)
+	}
+}
+
 func TestSupervisionAnnouncesPathStatesAndAges(t *testing.T) {
 	p := newClientServerPair(t)
 	for i := 0; i < 12 && p.readyClientPaths() < 2; i++ {

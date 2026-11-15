@@ -851,6 +851,14 @@ func (r *Receiver) accountArrival(p *receivePath, flow, number uint64, duplicate
 	if slot.key != key {
 		return
 	}
+	// A path still inside its post-flap hold-down (bfd.go) has resumed hearing the peer but has not
+	// yet proven itself, so packets catching up through it land well behind the other path by
+	// design. Counting that catch-up lag as skew would read a reconnect as a degraded path and feed
+	// the reorder budget (updateReorderBudget) a number that has nothing to do with the path's real
+	// duplicate-arrival spread.
+	if !p.bfd.up && !p.bfd.goodSince.IsZero() {
+		return
+	}
 	ms := float64(now.Sub(slot.at)) / float64(time.Millisecond)
 	if ms < 0 {
 		return
