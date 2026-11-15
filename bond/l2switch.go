@@ -1554,6 +1554,30 @@ func (s *L2Switch) Stats() L2SwitchStats {
 	return st
 }
 
+// FDBEntry describes a single learned MAC address binding.
+type FDBEntry struct {
+	MAC  [6]byte
+	Port PortID
+	VLAN uint16
+	Age  time.Duration
+}
+
+// FDBEntries returns a snapshot of every currently learned MAC address
+// binding. Callers that only care about a single port (e.g. a bridge
+// exposing its LAN-facing side) should filter on Port themselves.
+func (s *L2Switch) FDBEntries() []FDBEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]FDBEntry, 0, len(s.fdb))
+	for key, e := range s.fdb {
+		if e == nil {
+			continue
+		}
+		out = append(out, FDBEntry{MAC: key.mac, Port: e.port, VLAN: key.vlan.outer, Age: s.lastObserved.Sub(e.seen)})
+	}
+	return out
+}
+
 // DueRSTPBPDUs returns protocol frames that should be transmitted directly on
 // each participating port. They are control frames and must not pass through
 // Forward, which intentionally consumes incoming BPDUs.
