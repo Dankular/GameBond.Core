@@ -39,6 +39,42 @@ type askedRepair struct {
 	order    *list.Element
 	// exhausted marks a hole that used every attempt and is still missing.
 	exhausted bool
+	// resolved is set when the packet arrived after this ask, so it is judged once.
+	resolved bool
+}
+
+// askScaleMax bounds how far spurious asks can widen the wait before the next one.
+const askScaleMax = 3.
+
+// noteArrival judges an ask the moment its packet turns up. An answer to an ask needs at least the fastest
+// path's round trip, so a packet landing sooner than that was only late, and asking was wasted bandwidth
+// and a duplicate for the application. The wait before asking grows with the share of asks that were
+// spurious (as RACK's reordering window grows on DSACK) and shrinks back as they stop.
+func (s *Sender) noteArrival(key MissingPacket, now time.Time) {
+	a := s.asked[key]
+	if a == nil || a.resolved {
+		return
+	}
+	a.resolved = true
+	least := math.Inf(1)
+	for _, p := range s.r.paths {
+		if p.ready && p.hasRTT {
+			least = math.Min(least, p.rtt)
+		}
+	}
+	if math.IsInf(least, 1) {
+		return
+	}
+	sample := 0.
+	if now.Sub(a.at).Seconds() < .9*least {
+		s.stats.RepairSpurious++
+		sample = 1
+	} else {
+		s.stats.RepairAnswered++
+	}
+	s.spuriousRate += .02 * (sample - s.spuriousRate)
+	s.askScale = math.Min(askScaleMax, 1+4*math.Min(.5, s.spuriousRate))
+	s.stats.RepairAskScale = s.askScale
 }
 
 // A 100 Mbps bulk flow is about 10,000 packets a second, so the old 2048-entry
@@ -134,7 +170,7 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 		jitter = math.Max(jitter, p.jitter)
 	}
 	if s.nextRepairRequest.IsZero() || !now.Before(s.nextRepairRequest) {
-		delay := time.Duration(math.Max(.012, (maximum-minimum)/2+jitter) * float64(time.Second))
+		delay := time.Duration(math.Max(.012, (maximum-minimum)/2+jitter) * math.Max(1, s.askScale) * float64(time.Second))
 		// UDP holes are asked for too: a lost video or QUIC packet is worth a resend, and the
 			// peer answers late ones with an RepairNA, so asking costs one small frame.
 			missing := s.r.reorder.Missing(now, delay, repairBatch, nil)
@@ -177,6 +213,7 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 					s.askedOrder.MoveToBack(asked.order)
 				}
 				asked.at = now
+				asked.resolved = false
 				asked.attempts++
 				s.stats.RepairRequests++
 			}
@@ -262,8 +299,20 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 // repairLife is how long a sent packet stays cached; failover needs it to
 // outlive the suspicion delay.
 func (s *Sender) repairLife() time.Duration {
+	life := 5 * time.Second
 	if s.failover {
-		return 8 * time.Second
+		life = 8 * time.Second
 	}
-	return 5 * time.Second
+	// A repair must outlive the slowest path's round trip with room for several asks (SRT and RIST size the
+	// buffer from RTT the same way); on a long-delay path a fixed few seconds would expire entries mid-ask.
+	slow := 0.
+	for _, p := range s.r.paths {
+		if p.ready && p.hasRTT {
+			slow = math.Max(slow, p.rtt)
+		}
+	}
+	if need := time.Duration(repairAttempts * 2 * slow * float64(time.Second)); need > life {
+		life = need
+	}
+	return life
 }

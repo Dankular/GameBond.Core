@@ -63,7 +63,7 @@ type ReceiverStats struct {
 	FeedbackReceived, FeedbackRejected, FeedbackDuplicates     uint64
 	PolicyDrops                                                uint64
 	FECParity, FECRecovered, FECRecoveredRS                    uint64
-	ReorderScale                                               float64
+	ReorderScale, ReorderScaleUDP                              float64
 	BFDSent, BFDReceived, BFDUp, BFDDown, PathStalls         uint64
 }
 type receivePath struct {
@@ -168,7 +168,10 @@ type Receiver struct {
 	policyRevisionClient uint64
 	repairUnavailable    uint64
 	fec                  *fecState
-	reorderScale         float64   // >= 1: widens the wait while TCP packets keep arriving after it
+	arrived              func(MissingPacket, time.Time) // told of every flow packet's arrival, before reordering
+	udpScale             float64                        // >= 1: widens the UDP hole wait while UDP keeps arriving after it
+	tuneLateUDP          uint64
+	reorderScale         float64 // >= 1: widens the wait while TCP packets keep arriving after it
 	tuneAt               time.Time // last scale review
 	tuneLate, tuneDeliv  uint64
 }
@@ -424,7 +427,14 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 	case Striped:
 		valid = len(payload) >= 24
 	case Feedback:
-		valid = (len(payload) == 28 || len(payload) == feedbackSackSize) && binary.BigEndian.Uint32(payload[24:]) <= 1000000
+		valid = len(payload) >= 28 && binary.BigEndian.Uint32(payload[24:]) <= 1000000
+		if len(payload) > 28 {
+			if len(payload) < feedbackSackSize {
+				valid = false
+			} else if _, ok := decodeMissed(payload[feedbackSackSize:]); !ok {
+				valid = false
+			}
+		}
 	case Repair:
 		valid = len(payload) == 16
 	case LinkPolicy:
@@ -596,6 +606,9 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 		r.stats.PayloadBytes += uint64(len(payload) - 24)
 		flow, number := binary.BigEndian.Uint64(payload), binary.BigEndian.Uint64(payload[8:])
 		duplicates := r.reorder.stats.Duplicates
+		if r.arrived != nil {
+			r.arrived(MissingPacket{flow, number}, now)
+		}
 		out.Deliver = r.reorder.Push(flow, number, payload[24:], now)
 		r.accountArrival(p, flow, number, r.reorder.stats.Duplicates != duplicates, now)
 		for _, hit := range r.fecData(flow, number, payload[24:], now) {
@@ -670,7 +683,7 @@ func (p *receivePath) feedbackAllowed(now time.Time) bool {
 // received on this path, so the peer learns exactly which frames were lost instead of waiting
 // out a timer.
 func (r *Receiver) sendFeedback(p *receivePath, now time.Time, out *ReceiveResult) error {
-	payload := make([]byte, feedbackSackSize)
+	payload := make([]byte, feedbackSackSize, feedbackSackSize+1+sackMissMax*sackMissSize)
 	binary.BigEndian.PutUint64(payload, p.rxEpoch)
 	binary.BigEndian.PutUint64(payload[8:], p.stripeHighest)
 	binary.BigEndian.PutUint64(payload[16:], p.stripeBytes)
@@ -685,6 +698,7 @@ func (r *Receiver) sendFeedback(p *receivePath, now time.Time, out *ReceiveResul
 	base, bits := p.sack.Report()
 	binary.BigEndian.PutUint64(payload[28:], base)
 	copy(payload[36:], bits)
+	payload = encodeMissed(payload, p.sack.Missed())
 	if err := r.write(Feedback, payload, p.local, p.endpoint, out); err != nil {
 		return err
 	}
@@ -873,6 +887,9 @@ func (r *Receiver) updateReorderBudget() {
 	if count >= 2 {
 		udp = math.Min(timeout, math.Max(r.reorderBase.Seconds(), (maximum-minimum)/2+2*jitter))
 	}
+	if r.udpScale > 1 {
+		udp = math.Min(timeout, udp*r.udpScale)
+	}
 	// A hole in a TCP flow is repaired by a resend, which needs a round trip: wait for it
 	// (the slowest ready path's RTT plus jitter) instead of skipping the gap before the repair can
 	// arrive, which TCP reads as loss. UDP keeps its own short timeout, so game traffic is not delayed.
@@ -1027,6 +1044,13 @@ func (r *Receiver) resolveCopies(now time.Time, out *ReceiveResult) error {
 // arriving after the receiver gave up mean the wait is shorter than the real delay
 // spread, so it widens (up to 1.6x); when they stop it relaxes back. UDP is
 // excluded on purpose: its wait is deliberately short and late packets are delivered.
+// UDP lateness thresholds: the share of delivered packets that arrive after their hole was skipped.
+const (
+	udpRaiseRate = 0.003
+	udpLowerRate = 0.0005
+	maxUDPScale  = 1.5
+)
+
 func (r *Receiver) tuneReorder(now time.Time) {
 	const (
 		period    = 5 * time.Second
@@ -1046,7 +1070,8 @@ func (r *Receiver) tuneReorder(now time.Time) {
 	}
 	st := r.reorder.Stats()
 	dLate, dDeliv := st.LateTCP-r.tuneLate, st.Delivered-r.tuneDeliv
-	r.tuneAt, r.tuneLate, r.tuneDeliv = now, st.LateTCP, st.Delivered
+	dLateUDP := st.LateUDP - r.tuneLateUDP
+	r.tuneAt, r.tuneLate, r.tuneDeliv, r.tuneLateUDP = now, st.LateTCP, st.Delivered, st.LateUDP
 	if dDeliv < 2000 {
 		return
 	}
@@ -1057,6 +1082,19 @@ func (r *Receiver) tuneReorder(now time.Time) {
 	case rate < lowerRate:
 		r.reorderScale = math.Max(1, r.reorderScale*0.95)
 	}
+	// UDP gets its own scale (RACK's adaptive reordering window): a UDP packet arriving after its hole was
+	// skipped is delivered anyway, but the receiving app sees it as reordering, which QUIC and games read as
+	// loss. Widen the wait only while that keeps happening, and only a little: every UDP hole is held for it.
+	if r.udpScale == 0 {
+		r.udpScale = 1
+	}
+	switch rateUDP := float64(dLateUDP) / float64(dDeliv); {
+	case rateUDP > udpRaiseRate:
+		r.udpScale = math.Min(maxUDPScale, r.udpScale*1.1)
+	case rateUDP < udpLowerRate:
+		r.udpScale = math.Max(1, r.udpScale*0.95)
+	}
 	r.stats.ReorderScale = r.reorderScale
+	r.stats.ReorderScaleUDP = r.udpScale
 	r.updateReorderBudget()
 }

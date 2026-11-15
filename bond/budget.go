@@ -326,6 +326,31 @@ func (b *Budget) Sack(base uint64, bits []byte) []MissingPacket {
 	return lost
 }
 
+// SackMissed marks the pending frames whose sequences the peer named missing in evicted ranges. Those
+// gaps are older than the bitmap, so the later-frames threshold of Sack does not apply: the peer already
+// moved a whole window past them.
+func (b *Budget) SackMissed(ranges []missRange) []MissingPacket {
+	var lost []MissingPacket
+	for e := b.order.Front(); e != nil; e = e.Next() {
+		p := e.Value.(budgetPending)
+		if p.lost {
+			continue
+		}
+		for _, m := range ranges {
+			if p.sequence >= m.start && p.sequence-m.start < uint64(m.n) {
+				p.lost = true
+				e.Value = p
+				b.sackLost++
+				if p.keyed {
+					lost = append(lost, p.key)
+				}
+				break
+			}
+		}
+	}
+	return lost
+}
+
 // LostPending declares every still-unacknowledged keyed frame on this path lost and
 // returns the flow packets they carried. It is for a path that stopped answering: its
 // frames will never be reported by the selective acknowledgement, so without this a

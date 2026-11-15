@@ -50,6 +50,12 @@ type SenderStats struct {
 	// immediate resend, held back because a sibling copy may still arrive, or not
 	// recoverable (no cached payload: UDP, or too old).
 	SackLost, SackResent, SackHeld, SackUnrecoverable uint64
+	// Repairs we asked for, by what the arrival showed (the DSACK idea, RFC 2883, applied to our own asks):
+	// an asked packet that lands sooner than a round trip after the ask was never lost, only late, so the ask
+	// was spurious; one that lands later may have been answered. RepairAskScale is how far the wait before
+	// asking has been widened because asks kept turning out spurious.
+	RepairSpurious, RepairAnswered uint64
+	RepairAskScale                 float64
 	// Why a lost frame could not be resent: never cached (UDP or oversize), gone from
 	// the cache by age or size, or every resend attempt used. ReplaySkipped counts
 	// failover replays not sent because a healthy path already held a copy.
@@ -112,6 +118,8 @@ type Sender struct {
 	tombs             map[MissingPacket]*tombstone
 	tombOrder         []tombstoneRef
 	hints             map[int]pathHint
+	askScale          float64 // >= 1: widens the wait before asking for a hole while asks keep proving spurious
+	spuriousRate      float64
 }
 
 func NewSender(r *Receiver, initial, maximum float64) (*Sender, error) {
@@ -124,7 +132,9 @@ func NewSender(r *Receiver, initial, maximum float64) (*Sender, error) {
 	r.initialRate = initial
 	r.maxRate = maximum
 	r.probeInterval = 250 * time.Millisecond
-	return &Sender{r: r, flows: make(map[string]*sendFlow), repairs: make(map[MissingPacket]*repairEntry), repairRequests: make(map[MissingPacket]*list.Element), asked: make(map[MissingPacket]*askedRepair)}, nil
+	snd := &Sender{r: r, flows: make(map[string]*sendFlow), repairs: make(map[MissingPacket]*repairEntry), repairRequests: make(map[MissingPacket]*list.Element), asked: make(map[MissingPacket]*askedRepair)}
+	r.arrived = snd.noteArrival
+	return snd, nil
 }
 
 // EnableLossTracking makes replicated priority sends use DATA_COPY so the peer

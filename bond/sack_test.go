@@ -94,6 +94,11 @@ type wireFrame struct {
 
 func sendCaptured(t *testing.T, f receiverFixture, s *Sender, a []netip.AddrPort, n int) []wireFrame {
 	t.Helper()
+	return sendCapturedEvery(t, f, s, a, n, 10*time.Millisecond)
+}
+
+func sendCapturedEvery(t *testing.T, f receiverFixture, s *Sender, a []netip.AddrPort, n int, gap time.Duration) []wireFrame {
+	t.Helper()
 	var frames []wireFrame
 	writer := func(d Datagram) error {
 		pkt, err := f.c.Decode(d.Frame)
@@ -107,7 +112,7 @@ func sendCaptured(t *testing.T, f receiverFixture, s *Sender, a []netip.AddrPort
 		return nil
 	}
 	for i := 0; i < n; i++ {
-		now := f.now.Add(time.Duration(i) * 10 * time.Millisecond)
+		now := f.now.Add(time.Duration(i) * gap)
 		for _, k := range a {
 			f.r.paths[pk(k)].last = now
 		}
