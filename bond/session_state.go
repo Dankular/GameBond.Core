@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-const sessionStateVersion = 2
+const sessionStateVersion = 3
 
 // SessionFailoverState is the packet numbering and recovery state copied from
 // an active GameBond session to a warmed standby. It does not contain keys or
@@ -15,6 +15,7 @@ const sessionStateVersion = 2
 type SessionFailoverState struct {
 	Version        uint8
 	Session        [16]byte
+	Epoch          [16]byte
 	KeyFingerprint [32]byte
 	ClientIP       string
 	OptionsHash    [32]byte
