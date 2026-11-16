@@ -2,10 +2,11 @@ package bond
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"time"
 )
 
-const sessionStateVersion = 1
+const sessionStateVersion = 2
 
 // SessionFailoverState is the packet numbering and recovery state copied from
 // an active GameBond session to a warmed standby. It does not contain keys or
@@ -16,6 +17,7 @@ type SessionFailoverState struct {
 	Session        [16]byte
 	KeyFingerprint [32]byte
 	ClientIP       string
+	OptionsHash    [32]byte
 	DeviceIPs      []string
 	MTU            int
 	L2             bool
@@ -37,11 +39,16 @@ func (s *Session) SnapshotFailoverState(now time.Time, revision uint64) (Session
 	if revision == 0 {
 		return SessionFailoverState{}, ErrRecoveryState
 	}
+	optionsHash, err := recoveryOptionsHash(s.options)
+	if err != nil {
+		return SessionFailoverState{}, ErrRecoveryState
+	}
 	state := SessionFailoverState{
 		Version:        sessionStateVersion,
 		Session:        s.Receiver.codec.Session,
 		KeyFingerprint: sha256.Sum256(s.Receiver.codec.key[:]),
 		ClientIP:       s.options.ClientIP.String(),
+		OptionsHash:    optionsHash,
 		MTU:            s.options.MTU,
 		L2:             s.options.L2,
 		L2FrameMTU:     s.options.L2FrameMTU,
@@ -63,10 +70,17 @@ func (s *Session) SnapshotFailoverState(now time.Time, revision uint64) (Session
 // retained; its completed handshake provides the peer identity for the restored
 // sender state.
 func (s *Session) RestoreFailoverState(state SessionFailoverState) error {
-	if s == nil || s.Receiver == nil || s.Receiver.codec == nil || s.Sender == nil ||
+	if s == nil {
+		return ErrRecoveryState
+	}
+	optionsHash, err := recoveryOptionsHash(s.options)
+	if err != nil {
+		return ErrRecoveryState
+	}
+	if s.Receiver == nil || s.Receiver.codec == nil || s.Sender == nil ||
 		state.Version != sessionStateVersion || state.Session != s.Receiver.codec.Session ||
 		state.KeyFingerprint != sha256.Sum256(s.Receiver.codec.key[:]) ||
-		state.ClientIP != s.options.ClientIP.String() || state.MTU != s.options.MTU ||
+		state.ClientIP != s.options.ClientIP.String() || state.OptionsHash != optionsHash || state.MTU != s.options.MTU ||
 		state.L2 != s.options.L2 || state.L2FrameMTU != s.options.L2FrameMTU ||
 		len(state.DeviceIPs) != len(s.options.DeviceIPs) || state.Revision == 0 ||
 		state.CapturedAt.IsZero() ||
@@ -96,6 +110,58 @@ func (s *Session) RestoreFailoverState(state SessionFailoverState) error {
 	s.peer, s.hasPeer = s.Receiver.handshake.peer, true
 	s.stats = state.Stats
 	return nil
+}
+
+// recoveryOptionsHash binds a replicated packet snapshot to all static
+// transport behavior that can affect classification, pacing, or recovery.
+// Runtime path measurements and callbacks are deliberately node-local.
+func recoveryOptionsHash(options SessionOptions) ([32]byte, error) {
+	identity := struct {
+		MTU, PriorityHostMax int
+		ClientIP             string
+		DeviceIPs            []string
+		InitialRate          float64
+		MaximumRate          float64
+		ReorderTimeout       time.Duration
+		Policies             map[byte]QueuePolicy
+		GamePorts            []uint16
+		QoS                  QoSSettings
+		Redundant            bool
+		LossTracking         bool
+		PathMTUDiscovery     bool
+		FailoverReplay       bool
+		L2                   bool
+		L2FrameMTU           int
+		FlowPinning          bool
+		CoDel                bool
+		StripeAbove          float64
+		ParityRowsMin        int
+		ParityRowsMax        int
+		DelayControl         bool
+		DelayAssertive       bool
+		ECN                  bool
+		LabMode              bool
+	}{
+		MTU: options.MTU, PriorityHostMax: options.PriorityHostMax,
+		ClientIP: options.ClientIP.String(), InitialRate: options.InitialRate,
+		MaximumRate: options.MaximumRate, ReorderTimeout: options.ReorderTimeout,
+		Policies: options.Policies, GamePorts: options.GamePorts, QoS: options.QoS,
+		Redundant: options.Redundant, LossTracking: options.LossTracking,
+		PathMTUDiscovery: options.PathMTUDiscovery, FailoverReplay: options.FailoverReplay,
+		L2: options.L2, L2FrameMTU: options.L2FrameMTU, FlowPinning: options.FlowPinning,
+		CoDel: options.CoDel, StripeAbove: options.StripeAbove,
+		ParityRowsMin: options.ParityRowsMin, ParityRowsMax: options.ParityRowsMax,
+		DelayControl: options.DelayControl, DelayAssertive: options.DelayAssertive,
+		ECN: options.ECN, LabMode: options.LabMode,
+	}
+	for _, ip := range options.DeviceIPs {
+		identity.DeviceIPs = append(identity.DeviceIPs, ip.String())
+	}
+	encoded, err := json.Marshal(identity)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return sha256.Sum256(encoded), nil
 }
 
 // forLocalClock preserves each timer's age while replacing the source host's
