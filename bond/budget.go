@@ -30,7 +30,15 @@ type budgetPending struct {
 	keyed bool
 	// lost: the peer's selective acknowledgement showed later frames arriving without
 	// this one. It stays tracked until the cumulative acknowledgement retires it.
-	lost bool
+	lost        bool
+	mtuObserved bool
+}
+
+// SackObservation is one newly observed path-frame outcome. FrameSize is the
+// complete GameBond UDP payload size, including its packet header.
+type SackObservation struct {
+	FrameSize int
+	Delivered bool
 }
 
 // growthLossCeiling is the loss ratio above which a path stops growing. Random loss
@@ -40,8 +48,9 @@ const growthLossCeiling = .05
 
 // assertiveDelayFloor is the queueing delay (seconds over the baseline) an assertive
 // path tolerates before it counts as a standing queue. A loaded LEO link sits at
-// 20-40 ms by itself, so 10 ms made every busy second look like congestion.
-const assertiveDelayFloor = .040
+// 20-40 ms by itself, so a lower floor marked healthy delay as congestion.
+const assertiveDelayFloor = .050
+const delayPersistence = .1 // require a standing queue for a fixed time, not a fixed ACK count
 
 // BaseRTTWindow is the seconds per bucket of the decaying delay baseline.
 const BaseRTTWindow = 10.0
@@ -79,6 +88,8 @@ type Budget struct {
 	growthUtilization, growthAllowance, pacingWaitRatio, deliveryRate                   float64
 	congestionEpochs, delaySamples, startupIncreases                                    uint64
 	delayBackoffs                                                                       uint64
+	delayAboveSince                                                                     float64
+	delayAbove                                                                          bool
 	delayControl                                                                        bool
 	// delayAssertive also cuts the rate on a modest standing queue while the
 	// path carries real traffic (>= half the rate). Plain delay control waits for
@@ -287,6 +298,13 @@ const sackThreshold = 3
 // frames carried (each frame is reported once). It must run before Acknowledge, which
 // retires the entries.
 func (b *Budget) Sack(base uint64, bits []byte) []MissingPacket {
+	lost, _ := b.SackWithObservations(base, bits)
+	return lost
+}
+
+// SackWithObservations reports each positive or negative selective outcome once,
+// allowing per-path black-hole detection without double-counting repeated reports.
+func (b *Budget) SackWithObservations(base uint64, bits []byte) ([]MissingPacket, []SackObservation) {
 	end := base + uint64(len(bits))*8
 	type seen struct {
 		e   *list.Element
@@ -306,9 +324,16 @@ func (b *Budget) Sack(base uint64, bits []byte) []MissingPacket {
 	}
 	b.sackReports++
 	var lost []MissingPacket
+	var observations []SackObservation
 	later := 0
 	for i := len(window) - 1; i >= 0; i-- {
 		if window[i].got {
+			p := window[i].e.Value.(budgetPending)
+			if !p.mtuObserved {
+				p.mtuObserved = true
+				window[i].e.Value = p
+				observations = append(observations, SackObservation{FrameSize: p.size, Delivered: true})
+			}
 			later++
 			continue
 		}
@@ -317,13 +342,15 @@ func (b *Budget) Sack(base uint64, bits []byte) []MissingPacket {
 			continue
 		}
 		p.lost = true
+		p.mtuObserved = true
 		window[i].e.Value = p
+		observations = append(observations, SackObservation{FrameSize: p.size})
 		b.sackLost++
 		if p.keyed {
 			lost = append(lost, p.key)
 		}
 	}
-	return lost
+	return lost, observations
 }
 
 // SackMissed marks the pending frames whose sequences the peer named missing in evicted ranges. Those
@@ -496,11 +523,23 @@ func (b *Budget) Acknowledge(sequence, delivered uint64, now float64, delayUS ui
 	if b.delayAssertive {
 		delayFloor, delayVar, busy = assertiveDelayFloor, 2.5, utilization >= .5
 	}
-	if busy && math.Max(0, b.srtt-base) > math.Max(delayFloor, math.Max(base*.5, delayVar*b.rttVar)) {
+	queueThreshold := math.Max(delayFloor, delayVar*b.rttVar)
+	if !b.delayAssertive {
+		// The conservative mode scales with path RTT to avoid treating ordinary
+		// propagation delay as queueing. Assertive mode compares the same
+		// standing-queue threshold across paths; otherwise long-RTT flows sharing
+		// one bottleneck are allowed a larger queue and can starve short-RTT flows.
+		queueThreshold = math.Max(queueThreshold, base*.5)
+	}
+	if busy && math.Max(0, b.srtt-base) > queueThreshold {
+		if !b.delayAbove {
+			b.delayAbove, b.delayAboveSince = true, now
+		}
 		if b.delaySamples < 3 {
 			b.delaySamples++
 		}
 	} else {
+		b.delayAbove, b.delayAboveSince = false, 0
 		b.delaySamples = 0
 	}
 	b.measure(now)
@@ -525,11 +564,12 @@ func (b *Budget) reduce(now float64) {
 	b.backoffs++
 	b.resetEpoch(now)
 	b.delaySamples = 0
+	b.delayAbove, b.delayAboveSince = false, 0
 }
 
 // reduceForDelay answers a standing queue that loss never signals: the
 // bottleneck buffer is full and delaying everything behind it. The rate drops
-// by a tenth so the queue drains, at most once
+// by 10% so the queue drains, at most once
 // per two round trips, and never below the floor. It only runs when the path is
 // really being used (not app-limited), so sparse traffic is left alone.
 func (b *Budget) reduceForDelay(now float64) {
@@ -548,6 +588,7 @@ func (b *Budget) reduceForDelay(now float64) {
 	}
 	b.resetEpoch(now)
 	b.delaySamples = 0
+	b.delayAbove, b.delayAboveSince = false, 0
 }
 func (b *Budget) measure(now float64) {
 	if !b.hasEpoch {
@@ -605,7 +646,7 @@ func (b *Budget) measure(now float64) {
 	if b.congestionEpochs >= 2 {
 		b.reduce(now)
 		b.congestionEpochs = 0
-	} else if b.delayControl && b.delaySamples >= 3 && (!b.appLimited || (b.delayAssertive && utilization >= .5)) {
+	} else if b.delayControl && b.delayAbove && now-b.delayAboveSince >= delayPersistence && (!b.appLimited || (b.delayAssertive && utilization >= .5)) {
 		b.reduceForDelay(now)
 	}
 	// A path that mostly carries redundancy copies charges them as unpaced wire, which

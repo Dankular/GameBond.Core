@@ -24,13 +24,13 @@ func (r *Receiver) freshPath(local int, endpoint netip.AddrPort, now time.Time) 
 	if _, err := rand.Read(epoch[:]); err != nil {
 		return nil, err
 	}
-	p := &receivePath{local: local, endpoint: endpoint, txEpoch: binary.BigEndian.Uint64(epoch[:]), last: now}
+	p := &receivePath{local: local, endpoint: endpoint, txEpoch: binary.BigEndian.Uint64(epoch[:]), last: now, ecnLocal: r.ecnLocal[local]}
 	p.budget, _ = NewBudget(r.initialRate, r.maxRate)
 	p.budget.UseLiveLimits()
 	p.budget.delayControl = r.delayControl
 	p.budget.delayAssertive = r.delayAssertive
 	if r.mtuDiscovery {
-		p.mtu, _ = NewMTUProber(r.mtu, min(548, r.mtu))
+		p.mtu, _ = NewDPLPMTUD(r.mtu, min(548, r.mtu))
 	}
 	return p, nil
 }
@@ -83,11 +83,15 @@ func (r *Receiver) clientHandshake(p *receivePath, packet Packet, now time.Time)
 		return out, r.write(reply.Kind, reply.Payload, p.local, p.endpoint, &out)
 	}
 	if ready {
+		r.provisioning = p.hello.Provisioning()
 		if err := r.adoptClientPeer(peer, packet.Header.Sequence, now); err != nil {
 			return out, err
 		}
 		wasReady := p.ready
 		p.ready = true
+		if !wasReady && p.mtu != nil {
+			p.mtu.PathChanged()
+		}
 		p.last = now
 		if !wasReady {
 			r.noteLine(p, now, OutageLinkReady, "", 0)

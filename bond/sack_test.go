@@ -83,6 +83,41 @@ func TestBudgetSackNamesLostFramesOnceAfterThreeLaterArrivals(t *testing.T) {
 	}
 }
 
+func TestBudgetSackReportsPacketSizesOnceForMTUEvidence(t *testing.T) {
+	b, _ := NewBudget(10, 100)
+	for seq := uint64(1); seq <= 5; seq++ {
+		size := 500
+		if seq == 2 {
+			size = 1300
+		}
+		if _, err := b.Sent(seq, size, float64(seq)/100); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lost, outcomes := b.SackWithObservations(0, []byte{0x3a})
+	if len(lost) != 0 {
+		t.Fatalf("untagged SACK losses = %v", lost)
+	}
+	if len(outcomes) != 5 {
+		t.Fatalf("SACK outcomes = %+v, want five unique packet results", outcomes)
+	}
+	largeLoss, smallDelivered := 0, 0
+	for _, outcome := range outcomes {
+		if outcome.FrameSize == 1300 && !outcome.Delivered {
+			largeLoss++
+		}
+		if outcome.FrameSize == 500 && outcome.Delivered {
+			smallDelivered++
+		}
+	}
+	if largeLoss != 1 || smallDelivered != 4 {
+		t.Fatalf("size-correlated outcomes: %+v", outcomes)
+	}
+	if _, again := b.SackWithObservations(0, []byte{0x3a}); len(again) != 0 {
+		t.Fatalf("repeated report duplicated evidence: %+v", again)
+	}
+}
+
 // capture sends n TCP packets through the sender and returns every striped frame with
 // the path it used.
 type wireFrame struct {

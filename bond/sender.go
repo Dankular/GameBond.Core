@@ -42,6 +42,13 @@ const (
 )
 
 type SenderStats struct {
+	// RFC 8084-inspired aggregate congestion backstop. It reduces redundant wire
+	// traffic after persistent congestion; it does not replace per-path control.
+	CongestionBreakerTrips                                                                   uint64
+	CongestionBreakerState                                                                   string
+	AggregateSentBytesPerSecond, AggregateDeliveredBytesPerSecond, AggregateExpiredByteRatio float64
+	AggregateWindowLossRatio                                                                 float64
+	AggregateWindowSentBytes                                                                 uint64
 	// Datagrams refused because they exceed the session's datagram limit. Nothing else says so: the caller
 	// gets ErrFrame, so these counters are the only trace of a limit that is smaller than the traffic.
 	RefusedOversize, RefusedOversizeLargest, DatagramLimit                                                                                                                                                                                                                                                                                                                                                                                                             uint64
@@ -123,6 +130,7 @@ type Sender struct {
 	hints             map[int]pathHint
 	askScale          float64 // >= 1: widens the wait before asking for a hole while asks keep proving spurious
 	spuriousRate      float64
+	aggregateBreaker  aggregateCongestionBreaker
 }
 
 func NewSender(r *Receiver, initial, maximum float64) (*Sender, error) {
@@ -296,9 +304,9 @@ func (s *Sender) eligibleWith(now time.Time, boost, skipDown bool) []*receivePat
 	return backup
 }
 
-// fitPaths keeps the paths whose discovered outbound MTU can carry a datagram of
-// size bytes. When none fit it returns all of them: sending and risking loss
-// beats silence, matching the Python fallback.
+// fitPaths keeps only paths whose discovered outbound MTU can carry a datagram
+// of size bytes. When none fit, RFC 8899 forbids sending the oversized data
+// packet; the caller holds or rejects it while probing continues.
 func (s *Sender) fitPaths(paths []*receivePath, size int) []*receivePath {
 	if !s.r.mtuDiscovery {
 		return paths
@@ -313,7 +321,7 @@ func (s *Sender) fitPaths(paths []*receivePath, size int) []*receivePath {
 	}
 	if len(fit) == 0 {
 		s.stats.MTUNoFit++
-		return paths
+		return nil
 	}
 	return fit
 }
@@ -450,8 +458,14 @@ func (s *Sender) Urgent(payload []byte, replicate bool, now time.Time, writer Da
 		replicate = false
 	} else {
 		replicate = replicate || !s.lossTiered
+		if s.aggregateReductionActive(now) {
+			replicate = false
+		}
 	}
 	paths := s.fitPaths(s.eligible(now, true), len(payload)+Overhead)
+	if len(paths) == 0 {
+		return 0, ErrPathMTU
+	}
 	sort.Slice(paths, func(i, j int) bool {
 		a, b := paths[i], paths[j]
 		ca, cb := math.Inf(1), math.Inf(1)
@@ -478,7 +492,7 @@ func (s *Sender) Urgent(payload []byte, replicate bool, now time.Time, writer Da
 	}
 	sent := 0
 	for _, p := range paths {
-		if s.written(Datagram{Endpoint: p.endpoint, Frame: frame, Local: p.local}, p, now, writer) {
+		if s.written(Datagram{Endpoint: p.endpoint, Frame: frame, Local: p.local, TrafficClass: outerTrafficClassForPath(payload, p)}, p, now, writer) {
 			p.budget.UnpacedSent(len(frame), s.r.seconds(now), false)
 			sent++
 			s.stats.PriorityCopies++
@@ -592,6 +606,9 @@ func (s *Sender) Bulk(payload []byte, key string, now time.Time, writer Datagram
 		}
 	}
 	paths = s.fitPaths(paths, size)
+	if len(paths) == 0 {
+		return false, now.Add(time.Second), nil
+	}
 	ready := make(map[*receivePath]float64, len(paths))
 	transit := make(map[*receivePath]float64, len(paths))
 	primaryReady := false
@@ -717,7 +734,7 @@ func (s *Sender) Bulk(payload []byte, key string, now time.Time, writer Datagram
 		if err != nil {
 			return false, now, err
 		}
-		if s.written(Datagram{Endpoint: p.endpoint, Frame: frame, Local: p.local}, p, now, writer) {
+		if s.written(Datagram{Endpoint: p.endpoint, Frame: frame, Local: p.local, TrafficClass: outerTrafficClassForPath(payload, p)}, p, now, writer) {
 			sequence := binary.BigEndian.Uint64(frame[37:])
 			p.budget.Sent(sequence, len(frame), timestamp)
 			p.budget.Tag(sequence, MissingPacket{f.id, f.number})

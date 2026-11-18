@@ -50,6 +50,75 @@ func TestSessionValidatesTunnelAddressesBeforeLearningOrInjecting(t *testing.T) 
 		t.Fatal("IPv6 silently accepted")
 	}
 }
+
+func TestSessionReplicationCountsEveryWireCopyInAggregate(t *testing.T) {
+	f := newReceiverFixture(t)
+	options := DefaultSessionOptions()
+	options.InitialRate = 10
+	options.Redundant = true
+	s, err := NewSession(f.c.key[:], f.c.Session[:], options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addresses := []netip.AddrPort{
+		f.endpoint,
+		netip.MustParseAddrPort("127.0.0.1:1235"),
+	}
+	now := f.now
+	var handshakeReplies []Datagram
+	writer := func(d Datagram) error {
+		handshakeReplies = append(handshakeReplies, d)
+		return nil
+	}
+	for i, endpoint := range addresses {
+		hello, _ := f.c.Encode(Hello, bytes.Repeat([]byte{byte(4 + i)}, 16))
+		if err = s.UDP(hello, endpoint, now, writer); err != nil {
+			t.Fatal(err)
+		}
+		challenge, err := f.c.Decode(handshakeReplies[len(handshakeReplies)-1].Frame)
+		if err != nil || challenge.Header.Kind != Challenge {
+			t.Fatal("bad challenge", err)
+		}
+		reset, _ := f.c.Encode(Reset, challenge.Payload)
+		if err = s.UDP(reset, endpoint, now, writer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var payloadDatagrams []Datagram
+	packet := reverseUDP(udpPacket(1234, 443, 0))
+	if !s.TUN(packet, now) {
+		t.Fatal("session rejected outbound packet")
+	}
+	if _, err = s.Pump(now, func(d Datagram) error {
+		decoded, decodeErr := f.c.Decode(d.Frame)
+		if decodeErr == nil && (decoded.Header.Kind == Data || decoded.Header.Kind == DataCopy) {
+			payloadDatagrams = append(payloadDatagrams, d)
+		}
+		return nil
+	}, func([]byte) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(payloadDatagrams) != 2 {
+		t.Fatalf("replicated packet wrote %d copies, want 2", len(payloadDatagrams))
+	}
+	for _, d := range payloadDatagrams {
+		if d.Endpoint != addresses[0] && d.Endpoint != addresses[1] {
+			t.Fatalf("copy sent on unexpected path %v", d.Endpoint)
+		}
+	}
+	paths := s.Sender.Paths(now)
+	var pathWireBytes uint64
+	for _, p := range paths {
+		pathWireBytes += p.WireTX
+	}
+	if pathWireBytes < uint64(2*(len(payloadDatagrams[0].Frame)+28)) {
+		t.Fatalf("aggregate path accounting omitted copies or outer overhead: %d", pathWireBytes)
+	}
+	if stats := s.Sender.Stats(); stats.Copies != 2 || stats.PayloadPackets != 1 {
+		t.Fatalf("payload and wire-copy counters diverged: %+v", stats)
+	}
+}
+
 func TestSessionLearnsReturnQoSAndCountsActualDeviceWrites(t *testing.T) {
 	f, s, writer := sessionFixture(t)
 	packet := udpPacket(1234, 443, 26)

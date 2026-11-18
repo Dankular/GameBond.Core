@@ -62,6 +62,26 @@ func TestClassifierLearnsBidirectionalProfilesAndDoesNotGuessQUIC(t *testing.T) 
 		t.Fatal("explicit game port not honored")
 	}
 }
+
+func TestQueueTupleIsCanonicalDirectionalFiveTuple(t *testing.T) {
+	forward, err := ParseIPv4(udpPacket(1234, 443, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reverse, err := ParseIPv4(reverseUDP(udpPacket(1234, 443, 0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forward.Flow != reverse.Flow {
+		t.Fatal("bidirectional policy key should normalize endpoints")
+	}
+	if len(forward.QueueFlow) != 13 || len(reverse.QueueFlow) != 13 || forward.QueueFlow == reverse.QueueFlow {
+		t.Fatal("FQ-CoDel key must be the directional fixed-width IPv4 5-tuple")
+	}
+	if got := queued(udpPacket(1234, 443, 0), Classification{Info: forward}, time.Now()).Flow; got != forward.QueueFlow {
+		t.Fatal("transmit queue did not use the RFC 8290 tuple key")
+	}
+}
 func TestFragmentPolicyAssociationIsBoundedAndOrphansStayBulk(t *testing.T) {
 	c, _ := NewClassifier(nil, []uint16{3075}, DefaultQoSSettings())
 	now := time.Now()
@@ -82,6 +102,10 @@ func TestFragmentPolicyAssociationIsBoundedAndOrphansStayBulk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	firstInfo, err := ParseIPv4(first)
+	if err != nil || p.QueueFlow != firstInfo.QueueFlow {
+		t.Fatal("fragments of the same IPv4 datagram must share an FQ-CoDel queue", err)
+	}
 	if result := c.Classify(p, now.Add(time.Second)); result.Tag != 46 || result.Reason != "fragment_cache" {
 		t.Fatal("later fragment association lost")
 	}
@@ -89,6 +113,24 @@ func TestFragmentPolicyAssociationIsBoundedAndOrphansStayBulk(t *testing.T) {
 		t.Fatal("later fragments extended TTL")
 	}
 }
+
+func TestUnclassifiedPacketsGetAddressProtocolFlowKey(t *testing.T) {
+	packet := udpPacket(1234, 443, 0)
+	packet[9] = 1 // ICMP has no transport ports for the 5-tuple.
+	info, err := ParseIPv4(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Flow != "" || info.FallbackFlow == "" {
+		t.Fatalf("unexpected flow keys: transport=%q fallback=%q", info.Flow, info.FallbackFlow)
+	}
+	classified := Classification{Info: info, Policy: DefaultQueuePolicy()}
+	packetQueue := queued(packet, classified, time.Now())
+	if packetQueue.Flow != info.QueueFlow || info.QueueFlow != info.FallbackFlow {
+		t.Fatalf("queued flow key %q, want address/protocol key", packetQueue.Flow)
+	}
+}
+
 func TestAdaptiveRedundancyRequiresFreshQualityAndHasRecoveryHold(t *testing.T) {
 	f, s, a := senderFixture(t, 2)
 	q, _ := NewAdaptiveQoS(DefaultQoSSettings())

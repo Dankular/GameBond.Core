@@ -8,6 +8,9 @@ import (
 type SessionOptions struct {
 	// Version is the build id (git commit) reported to the client.
 	Version string
+	// GatewayProvisioning is the topology-owned role and client link profile
+	// delivered in authenticated READY responses. It contains no lease data.
+	GatewayProvisioning *GatewayProvisioning
 	// State, when set, is polled for a word announced to clients ("updating").
 	State    func() string
 	MTU      int
@@ -35,6 +38,7 @@ type SessionOptions struct {
 	StripeAbove                  float64
 	ParityRowsMin, ParityRowsMax int
 	DelayControl, DelayAssertive bool
+	ECN                          bool
 	// LabMode disables adaptive loss protection and reorder smoothing so
 	// virtual-link impairments remain visible to the application.
 	LabMode bool
@@ -61,6 +65,8 @@ type Session struct {
 	stats      SessionStats
 	peer       [16]byte
 	hasPeer    bool
+	replEpoch  [16]byte
+	replRev    uint64
 }
 
 func NewSession(key, session []byte, options SessionOptions) (*Session, error) {
@@ -83,11 +89,19 @@ func NewSession(key, session []byte, options SessionOptions) (*Session, error) {
 	}
 	r.SetVersion(options.Version)
 	r.SetStateFunc(options.State)
+	if err := r.SetGatewayProvisioning(options.GatewayProvisioning); err != nil {
+		return nil, err
+	}
 	if err = r.SetReorderTimeout(options.ReorderTimeout); err != nil {
 		return nil, err
 	}
 	if err = r.SetPathMTUDiscovery(options.PathMTUDiscovery); err != nil {
 		return nil, err
+	}
+	if options.ECN {
+		if err = r.SetECN(0, true); err != nil {
+			return nil, err
+		}
 	}
 	sender, err := NewSender(r, options.InitialRate, options.MaximumRate)
 	if err != nil {
@@ -177,7 +191,14 @@ func (s *Session) ownsTunnelIP(a [4]byte) bool {
 	return false
 }
 func queued(packet []byte, c Classification, now time.Time) QueuedPacket {
-	return QueuedPacket{Payload: packet, Flow: c.Info.Flow, Priority: c.Policy.Priority, Replicate: c.Policy.Replicate, Expires: now.Add(time.Duration(c.Policy.MaxAgeMS * float64(time.Millisecond))), Tag: c.Tag, ClassCapacity: c.Policy.Capacity}
+	flow := c.Info.QueueFlow
+	if flow == "" {
+		flow = c.Info.Flow
+	}
+	if flow == "" {
+		flow = c.Info.FallbackFlow
+	}
+	return QueuedPacket{Payload: packet, Flow: flow, Priority: c.Policy.Priority, Replicate: c.Policy.Replicate, Expires: now.Add(time.Duration(c.Policy.MaxAgeMS * float64(time.Millisecond))), Tag: c.Tag, ClassCapacity: c.Policy.Capacity}
 }
 func (s *Session) process(result ReceiveResult, now time.Time, writer DatagramWriter) {
 	s.syncPeer()
@@ -198,6 +219,29 @@ func (s *Session) UDP(frame []byte, endpoint netip.AddrPort, now time.Time, writ
 	s.process(result, now, writer)
 	return nil
 }
+
+// UpdateGatewayProvisioning promotes or demotes this exit without restarting
+// the bonded session. The topology controller is the source of truth and must
+// supply a strictly newer revision; DHCP lease data is never transmitted.
+func (s *Session) UpdateGatewayProvisioning(p *GatewayProvisioning, now time.Time, writer DatagramWriter) error {
+	result, err := s.Receiver.UpdateGatewayProvisioning(p)
+	if err != nil {
+		return err
+	}
+	s.process(result, now, writer)
+	return nil
+}
+
+// UDPWithOuterECN is UDP with the ECN codepoint observed on the outer IPv4
+// header, enabling RFC 6040 decapsulation for data carried by this datagram.
+func (s *Session) UDPWithOuterECN(frame []byte, endpoint netip.AddrPort, now time.Time, writer DatagramWriter, outerECN byte) error {
+	result, err := s.Receiver.ReceiveViaECN(0, frame, endpoint, now, true, outerECN)
+	if err != nil {
+		return err
+	}
+	s.process(result, now, writer)
+	return nil
+}
 func (s *Session) TUN(packet []byte, now time.Time) bool {
 	s.syncPeer()
 	c, ok := s.classify(packet, false, now)
@@ -210,7 +254,7 @@ func (s *Session) TUN(packet []byte, now time.Time) bool {
 	if s.options.Redundant {
 		p.Replicate = true
 	}
-	return s.Transmit.Enqueue(p)
+	return s.Transmit.EnqueueAt(p, now)
 }
 func (s *Session) Pump(now time.Time, writer DatagramWriter, inject func([]byte) error) (time.Time, error) {
 	result, err := s.Receiver.Tick(now)

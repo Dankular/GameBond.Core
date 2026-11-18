@@ -124,6 +124,9 @@ func (s *Sender) cacheRepair(key MissingPacket, payload []byte, now time.Time, o
 // and sequence numbers, so first arrival wins without injecting duplicates.
 func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 	s.syncPeer()
+	if !s.labMode {
+		s.observeAggregateCongestion(now)
+	}
 	for s.repairOrder.Len() > 0 {
 		old := s.repairOrder.Front().Value.(*repairEntry)
 		if now.Sub(old.at) < s.repairLife() {
@@ -284,7 +287,7 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 		if err != nil {
 			return err
 		}
-		if !s.written(Datagram{Endpoint: target.endpoint, Frame: frame, Local: target.local}, target, now, writer) {
+		if !s.written(Datagram{Endpoint: target.endpoint, Frame: frame, Local: target.local, TrafficClass: outerTrafficClassForPath(cached.payload, target)}, target, now, writer) {
 			break
 		}
 		sequence := binary.BigEndian.Uint64(frame[37:])
@@ -321,7 +324,7 @@ func (s *Sender) Maintenance(now time.Time, writer DatagramWriter) error {
 			copy(body2[24:], cached.payload)
 			if frame2, err := s.r.codec.Encode(Striped, body2); err != nil {
 				return err
-			} else if s.written(Datagram{Endpoint: second.endpoint, Frame: frame2, Local: second.local}, second, now, writer) {
+			} else if s.written(Datagram{Endpoint: second.endpoint, Frame: frame2, Local: second.local, TrafficClass: outerTrafficClassForPath(cached.payload, second)}, second, now, writer) {
 				sequence2 := binary.BigEndian.Uint64(frame2[37:])
 				second.budget.Sent(sequence2, len(frame2), timestamp)
 				second.budget.Tag(sequence2, key)

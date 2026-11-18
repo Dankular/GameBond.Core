@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"math"
 	"net/netip"
-	"strings"
 	"time"
 )
 
@@ -21,6 +20,9 @@ type PathKey struct {
 type Datagram struct {
 	Endpoint netip.AddrPort
 	Frame    []byte
+	// TrafficClass is the inner IPv4 DS field to copy to the outer header for a
+	// data-bearing packet (ECN plus DSCP). Control and parity leave it zero.
+	TrafficClass byte
 	// Local is the index of the socket to send from (0 for a server).
 	Local int
 	// DirectUDP asks the caller to send over UDP even if the path has fallen
@@ -50,6 +52,8 @@ type ReceiverStats struct {
 	PayloadPackets, PayloadBytes, WireRX, WireTX, SendErrors                                  uint64
 	ReplayTooOld, ReplayTooFar                                                                uint64
 	IgnoredWhileRestarting                                                                    uint64
+	OuterECNCE, InnerECNPropagated, InnerECNDropped                                           uint64
+	ECNCapabilitySent, ECNCapabilityReceived                                                  uint64
 	// Datagrams larger than the session limit, kept apart from Malformed so a limit smaller than the peer's
 	// frames is not mistaken for corruption.
 	Oversize, OversizeLargest    uint64
@@ -109,8 +113,10 @@ type receivePath struct {
 	probeSent, probeAcked, probeLost uint64
 	acceptedSequence, acceptedBytes  uint64
 	hasFeedback                      bool
-	mtu                              *MTUProber
+	mtu                              *DPLPMTUD
 	mtuAcks, mtuSkips                uint64
+	ecnLocal, ecnPeer                bool
+	versionAsked                     time.Time
 	suspect                          bool
 	bfd                              bfdState
 	peerCopy                         [3]uint64
@@ -136,9 +142,9 @@ type Receiver struct {
 	peerState            string        // the server's announced state ("updating"), client side
 	stateFn              func() string // server side: current state to announce
 	lastState            string
-	versionAsked         time.Time // last VersionReq sent (client)
 	codec                *Codec
 	handshake            *ServerHandshake
+	provisioning         *GatewayProvisioning
 	replay               ReplayWindow
 	firsts               [1 << 16]firstArrival
 	skewSamples          uint64
@@ -166,6 +172,7 @@ type Receiver struct {
 	labMode              bool
 	delayControl         bool
 	delayAssertive       bool
+	ecnLocal             map[int]bool
 	policyRevisionClient uint64
 	repairUnavailable    uint64
 	fec                  *fecState
@@ -182,7 +189,33 @@ func NewReceiver(codec *Codec, mtu int) (*Receiver, error) {
 		return nil, ErrFrame
 	}
 	r, _ := NewReorder(DefaultReorderConfig())
-	return &Receiver{role: codec.role, codec: codec, handshake: NewServerHandshake(), paths: make(map[PathKey]*receivePath), reorder: r, mtu: mtu, initialRate: 1, maxRate: 100, probes: make(map[[24]byte]pendingProbe), reorderBase: 30 * time.Millisecond, copies: newCopyLedger(), outages: newOutageJournal()}, nil
+	return &Receiver{role: codec.role, codec: codec, handshake: NewServerHandshake(), paths: make(map[PathKey]*receivePath), reorder: r, mtu: mtu, initialRate: 1, maxRate: 100, probes: make(map[[24]byte]pendingProbe), reorderBase: 30 * time.Millisecond, copies: newCopyLedger(), outages: newOutageJournal(), ecnLocal: make(map[int]bool)}, nil
+}
+
+// SetECN configures whether a local UDP socket can receive outer ECN and
+// propagate it during decapsulation. Configure it before the path handshake
+// completes. The capability is advertised per path; peers that do not
+// recognize it never receive outer ECT markings from this endpoint.
+func (r *Receiver) SetECN(local int, on bool) error {
+	if local < 0 {
+		return ErrFrame
+	}
+	for _, p := range r.paths {
+		if p.local == local && p.ready {
+			return ErrFrame
+		}
+	}
+	if on {
+		r.ecnLocal[local] = true
+	} else {
+		delete(r.ecnLocal, local)
+	}
+	for _, p := range r.paths {
+		if p.local == local {
+			p.ecnLocal = on
+		}
+	}
+	return nil
 }
 func (r *Receiver) SetReorderTimeout(timeout time.Duration) error {
 	if len(r.paths) > 0 || timeout < time.Millisecond || timeout > 200*time.Millisecond {
@@ -201,6 +234,51 @@ func (r *Receiver) SetLabMode(on bool) {
 		r.reorder.config.Timeout = r.reorderBase
 		r.reorder.config.UDPTimeout = r.reorderBase
 	}
+}
+
+// SetGatewayProvisioning assigns the topology-owned role sent in subsequent
+// authenticated READY responses. Configure it before accepting client paths.
+func (r *Receiver) SetGatewayProvisioning(p *GatewayProvisioning) error {
+	if r.role != "server" || len(r.paths) != 0 {
+		return ErrFrame
+	}
+	if err := r.handshake.SetProvisioning(p); err != nil {
+		return err
+	}
+	r.provisioning = cloneGatewayProvisioning(p)
+	return nil
+}
+
+// UpdateGatewayProvisioning applies a newer topology assignment and sends it
+// to every ready client path. New handshakes receive the same assignment in
+// READY. Revisions must increase monotonically for this session.
+func (r *Receiver) UpdateGatewayProvisioning(p *GatewayProvisioning) (ReceiveResult, error) {
+	var out ReceiveResult
+	if r.role != "server" || p == nil || (r.provisioning != nil && p.Revision <= r.provisioning.Revision) {
+		return out, ErrFrame
+	}
+	encoded, err := encodeGatewayProvisioning(p)
+	if err != nil {
+		return out, err
+	}
+	r.provisioning = cloneGatewayProvisioning(p)
+	r.handshake.provisioning = encoded
+	for _, path := range r.paths {
+		if !path.ready {
+			continue
+		}
+		if err := r.write(GatewayProvisioningUpdate, encoded, path.local, path.endpoint, &out); err != nil {
+			return out, err
+		}
+	}
+	return out, nil
+}
+
+// GatewayProvisioning returns the last validated topology assignment. On the
+// client this is populated only after an authenticated READY; on the server it
+// is the assignment configured before accepting clients.
+func (r *Receiver) GatewayProvisioning() *GatewayProvisioning {
+	return cloneGatewayProvisioning(r.provisioning)
 }
 
 // SetPathMTUDiscovery enables per-path outbound MTU probing (kinds 14/15).
@@ -257,6 +335,7 @@ func (r *Receiver) newPath(local int, endpoint netip.AddrPort, now time.Time) (*
 	if err != nil {
 		return nil, err
 	}
+	p.ecnLocal = r.ecnLocal[local]
 	if len(r.paths) >= 8 {
 		var oldest *receivePath
 		for _, p := range r.paths {
@@ -284,10 +363,54 @@ func (r *Receiver) ReceiveOn(local int, frame []byte, endpoint netip.AddrPort, n
 // UDP (true) or a stream carrier (false); only a UDP CHALLENGE can complete a
 // UDP recovery.
 func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, now time.Time, viaUDP bool) (ReceiveResult, error) {
+	return r.receiveVia(local, frame, endpoint, now, viaUDP, nil)
+}
+
+// ReceiveViaECN is ReceiveVia with the ECN codepoint observed on the outer
+// IP header. It applies RFC 6040 to decapsulated IP payloads carried by data
+// frames. Pass only the low two bits of the outer DS field.
+func (r *Receiver) ReceiveViaECN(local int, frame []byte, endpoint netip.AddrPort, now time.Time, viaUDP bool, outerECN byte) (ReceiveResult, error) {
+	return r.receiveVia(local, frame, endpoint, now, viaUDP, &outerECN)
+}
+
+func (r *Receiver) propagateOuterECN(p *receivePath, inner []byte, outerECN *byte) bool {
+	if outerECN == nil || p == nil || !p.ecnLocal {
+		return true
+	}
+	if *outerECN == 3 {
+		r.stats.OuterECNCE++
+	}
+	innerECN, validIP := packetECN(inner)
+	if validIP && innerECN == 0 && *outerECN == 3 {
+		r.stats.InnerECNDropped++
+		return false
+	}
+	propagated, err := PropagateTunnelECN(inner, *outerECN)
+	if err != nil {
+		r.stats.Malformed++
+		return false
+	}
+	propagatedECN, _ := packetECN(propagated)
+	if propagatedECN != innerECN {
+		r.stats.InnerECNPropagated++
+		copy(inner, propagated)
+	}
+	return true
+}
+
+func packetECN(packet []byte) (byte, bool) {
+	trafficClass, ok := innerTrafficClass(packet)
+	return trafficClass & 3, ok
+}
+
+func (r *Receiver) receiveVia(local int, frame []byte, endpoint netip.AddrPort, now time.Time, viaUDP bool, outerECN *byte) (ReceiveResult, error) {
 	var out ReceiveResult
 	key := PathKey{local, endpoint}
 	timestamp := r.seconds(now)
-	if len(frame) > r.mtu {
+	// Provisioning is authenticated inside READY, but it can make that control
+	// datagram larger than the configured data MTU. Bound the exception tightly.
+	provisioningReady := r.role == "client" && len(frame) > r.mtu && len(frame) <= r.mtu+gatewayProvisioningMaxExtension && len(frame) > 36 && frame[36] == Ready
+	if len(frame) > r.mtu && !provisioningReady {
 		r.stats.Oversize++
 		r.stats.OversizeLargest = max(r.stats.OversizeLargest, uint64(len(frame)))
 		return out, nil
@@ -369,7 +492,11 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 					return out, err
 				}
 			}
+			wasReady := p.ready
 			p.ready = true
+			if !wasReady && p.mtu != nil {
+				p.mtu.PathChanged()
+			}
 			p.touch(now)
 			if h.Sequence > p.lastSequence {
 				p.lastSequence = h.Sequence
@@ -464,6 +591,8 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 		valid = validSupervision(payload)
 	case VersionReq, VersionInfo:
 		valid = len(payload) <= 64
+	case GatewayProvisioningUpdate:
+		valid = r.role == "client" && len(payload) <= gatewayProvisioningMaxExtension
 	case Parity:
 		valid = len(payload) >= parityHeader+2
 	case ParityRS:
@@ -563,14 +692,33 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 			r.stats.Malformed++
 			break
 		}
-		r.peerVersion = string(payload)
-		err = r.write(VersionInfo, r.versionInfo(), local, endpoint, &out)
+		r.peerVersion, p.ecnPeer = parseVersionRequest(payload)
+		if p.ecnPeer {
+			r.stats.ECNCapabilityReceived++
+		}
+		if p.ecnPeer && p.ecnLocal {
+			r.stats.ECNCapabilitySent++
+		}
+		err = r.write(VersionInfo, r.versionInfo(p), local, endpoint, &out)
 	case VersionInfo:
 		if r.role != "client" {
 			r.stats.Malformed++
 			break
 		}
-		r.peerVersion, r.peerState, _ = strings.Cut(string(payload), "|")
+		r.peerVersion, r.peerState, p.ecnPeer = parseVersionInfo(payload)
+		if p.ecnPeer {
+			r.stats.ECNCapabilityReceived++
+		}
+	case GatewayProvisioningUpdate:
+		provisioning, decodeErr := decodeGatewayProvisioning(payload)
+		if decodeErr != nil {
+			r.stats.Malformed++
+			break
+		}
+		if r.provisioning != nil && provisioning.Revision <= r.provisioning.Revision {
+			break
+		}
+		r.provisioning = provisioning
 	case LinkPolicyAck:
 		// Only a client with a policy of its own can be acknowledged.
 		revision, epoch := binary.BigEndian.Uint64(payload), binary.BigEndian.Uint64(payload[8:])
@@ -613,6 +761,9 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 				r.stats.GapFeedback++
 			}
 		}
+		if !r.propagateOuterECN(p, payload[24:], outerECN) {
+			return out, nil
+		}
 		r.stats.PayloadPackets++
 		r.stats.PayloadBytes += uint64(len(payload) - 24)
 		flow, number := binary.BigEndian.Uint64(payload), binary.BigEndian.Uint64(payload[8:])
@@ -642,7 +793,7 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 		binary.BigEndian.PutUint32(reply[8:], uint32(len(frame)))
 		err = r.write(MTUAck, reply, local, endpoint, &out)
 	case MTUAck:
-		if p.mtu != nil && p.mtu.Acknowledge(binary.BigEndian.Uint64(payload), int(binary.BigEndian.Uint32(payload[8:]))) {
+		if p.mtu != nil && p.mtu.Acknowledge(binary.BigEndian.Uint64(payload), int(binary.BigEndian.Uint32(payload[8:])), timestamp) {
 			p.mtuAcks++
 		}
 	case RepairNA:
@@ -653,6 +804,9 @@ func (r *Receiver) ReceiveVia(local int, frame []byte, endpoint netip.AddrPort, 
 	case CopyReport:
 		p.peerCopy = [3]uint64{binary.BigEndian.Uint64(payload), binary.BigEndian.Uint64(payload[8:]), binary.BigEndian.Uint64(payload[16:])}
 	case Data, DataCopy:
+		if !r.propagateOuterECN(p, payload, outerECN) {
+			return out, nil
+		}
 		if h.Kind == DataCopy {
 			r.copies.First(h.Sequence, p.key(), r.expectedCopyPaths(now), timestamp)
 		}
@@ -785,10 +939,13 @@ func (r *Receiver) Tick(now time.Time) (ReceiveResult, error) {
 				if r.peerVersion == "" {
 					every = 2 * time.Second // not known yet (or the server predates this frame)
 				}
-				if now.Sub(r.versionAsked) >= every {
-					r.versionAsked = now
-					if err := r.write(VersionReq, []byte(r.version), p.local, p.endpoint, &out); err != nil {
+				if p.versionAsked.IsZero() || now.Sub(p.versionAsked) >= every {
+					p.versionAsked = now
+					if err := r.write(VersionReq, r.versionRequest(p), p.local, p.endpoint, &out); err != nil {
 						return out, err
+					}
+					if p.ecnLocal {
+						r.stats.ECNCapabilitySent++
 					}
 				}
 			}
@@ -808,7 +965,7 @@ func (r *Receiver) Tick(now time.Time) (ReceiveResult, error) {
 				return out, err
 			}
 			if p.mtu != nil {
-				for _, probe := range p.mtu.Due(r.seconds(now), randomNonce) {
+				for _, probe := range p.mtu.Due(r.seconds(now), p.rtt, randomNonce) {
 					body := make([]byte, probe.Size-Overhead)
 					binary.BigEndian.PutUint64(body, probe.Nonce)
 					binary.BigEndian.PutUint32(body[8:], uint32(probe.Size))

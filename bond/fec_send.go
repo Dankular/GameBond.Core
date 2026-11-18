@@ -34,6 +34,12 @@ func (s *Sender) protectionLevel(paths []*receivePath, now time.Time) protection
 	if s.labMode {
 		return protectNone
 	}
+	if s.aggregateReductionActive(now) {
+		if s.aggregateBreaker.phase == aggregateBreakerHalfOpen {
+			return protectParity
+		}
+		return protectNone
+	}
 	if !s.lossTiered {
 		return protectDuplicate
 	}
@@ -128,7 +134,7 @@ func (s *Sender) duplicate(f *sendFlow, number uint64, payload []byte, used *rec
 	if err != nil {
 		return false
 	}
-	if s.written(Datagram{Endpoint: target.endpoint, Frame: frame, Local: target.local}, target, now, writer) {
+	if s.written(Datagram{Endpoint: target.endpoint, Frame: frame, Local: target.local, TrafficClass: outerTrafficClassForPath(payload, target)}, target, now, writer) {
 		// Always tracked: the receiver acknowledges this frame's sequence, and an
 		// untracked sequence makes that path's feedback get rejected (everything
 		// then times out and the feedback-timeout ratio reads 100%).

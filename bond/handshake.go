@@ -25,10 +25,11 @@ type confirmation struct {
 // ServerHandshake consumes only packets already authenticated by Codec.Decode.
 // Recorded old challenges cannot replace the live peer's encryption domain.
 type ServerHandshake struct {
-	peer      [16]byte
-	hasPeer   bool
-	pending   map[challengeKey]challengeProof
-	confirmed map[netip.AddrPort]confirmation
+	peer         [16]byte
+	hasPeer      bool
+	pending      map[challengeKey]challengeProof
+	confirmed    map[netip.AddrPort]confirmation
+	provisioning []byte
 }
 
 type HandshakeReply struct {
@@ -41,6 +42,17 @@ type HandshakeReply struct {
 
 func NewServerHandshake() *ServerHandshake {
 	return &ServerHandshake{pending: make(map[challengeKey]challengeProof), confirmed: make(map[netip.AddrPort]confirmation)}
+}
+
+// SetProvisioning sets the topology assignment included in authenticated READY
+// responses. Set it before accepting client connections.
+func (h *ServerHandshake) SetProvisioning(p *GatewayProvisioning) error {
+	encoded, err := encodeGatewayProvisioning(p)
+	if err != nil {
+		return err
+	}
+	h.provisioning = encoded
+	return nil
 }
 
 func (h *ServerHandshake) Handle(packet Packet, endpoint netip.AddrPort, now time.Time) (HandshakeReply, bool, error) {
@@ -121,6 +133,7 @@ func (h *ServerHandshake) Handle(packet Packet, endpoint netip.AddrPort, now tim
 	}
 	reply.Kind = Ready
 	reply.Payload = append(append([]byte(nil), packet.Payload[16:]...), packet.Payload[:16]...)
+	reply.Payload = append(reply.Payload, h.provisioning...)
 	reply.Peer = h.peer
 	reply.FreshProof = fresh
 	return reply, true, nil

@@ -176,6 +176,9 @@ type MTUStats struct {
 	Ceiling     int
 	Confirmed   int // valid only when Capable
 	Capable     bool
+	State       DPLPMTUDState
+	ProbeCount  int
+	ProbeSize   int
 	Rounds      int
 	Acks        int
 	FailedSizes []int

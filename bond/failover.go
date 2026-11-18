@@ -146,7 +146,7 @@ func (s *Sender) failoverStep(now time.Time, writer DatagramWriter) error {
 		if err != nil {
 			return err
 		}
-		if !s.written(Datagram{Endpoint: target.endpoint, Frame: frame, Local: target.local}, target, now, writer) {
+		if !s.written(Datagram{Endpoint: target.endpoint, Frame: frame, Local: target.local, TrafficClass: outerTrafficClassForPath(cached.payload, target)}, target, now, writer) {
 			break
 		}
 		sequence := binary.BigEndian.Uint64(frame[37:])

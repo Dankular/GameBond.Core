@@ -24,6 +24,10 @@ type clientServerPair struct {
 }
 
 func newClientServerPair(t *testing.T) *clientServerPair {
+	return newClientServerPairWithMTU(t, false)
+}
+
+func newClientServerPairWithMTU(t *testing.T, mtuDiscovery bool) *clientServerPair {
 	t.Helper()
 	key, session := bytes.Repeat([]byte{4}, 32), bytes.Repeat([]byte{5}, 16)
 	cc, _ := NewCodec(key, session, "client")
@@ -33,6 +37,14 @@ func newClientServerPair(t *testing.T) *clientServerPair {
 		t.Fatal(err)
 	}
 	sr, _ := NewReceiver(sc, 1400)
+	if mtuDiscovery {
+		if err := cr.SetPathMTUDiscovery(true); err != nil {
+			t.Fatal(err)
+		}
+		if err := sr.SetPathMTUDiscovery(true); err != nil {
+			t.Fatal(err)
+		}
+	}
 	cr.probeInterval, sr.probeInterval = 250*time.Millisecond, 250*time.Millisecond
 	p := &clientServerPair{t: t, client: cr, server: sr, now: time.Unix(5000, 0),
 		srv: netip.MustParseAddrPort("203.0.113.1:4433"),
@@ -43,6 +55,54 @@ func newClientServerPair(t *testing.T) *clientServerPair {
 		}
 	}
 	return p
+}
+
+func TestClientServerDPLPMTUDSearchesEachLimitedPath(t *testing.T) {
+	p := newClientServerPairWithMTU(t, true)
+	p.limit[0] = 800 // fail MTU probes larger than this path's packetization limit
+	for i := 0; i < 520; i++ {
+		p.step()
+		path := p.client.paths[PathKey{0, p.srv}]
+		if path != nil && path.mtu != nil && path.mtu.State() == DPLPMTUDSearchComplete {
+			if got := path.mtu.PathMTU(); got != 800 {
+				t.Fatalf("client path 0 discovered %d, want 800", got)
+			}
+			return
+		}
+	}
+	path := p.client.paths[PathKey{0, p.srv}]
+	if path == nil || path.mtu == nil {
+		t.Fatal("client path has no DPLPMTUD state")
+	}
+	t.Fatalf("DPLPMTUD did not settle: %+v", path.mtu.Stats())
+}
+
+func TestTransmitQueueDropsPriorityDatagramWhenNoPathFitsMTU(t *testing.T) {
+	p := newClientServerPairWithMTU(t, true)
+	for i := 0; i < 8 && p.readyClientPaths() < 2; i++ {
+		p.step()
+	}
+	for _, path := range p.client.paths {
+		path.mtu.confirmed = 548
+		path.mtu.state = DPLPMTUDSearchComplete
+	}
+	sender := &Sender{r: p.client}
+	queue, err := NewTransmitQueue(sender, 8, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := udpOfSize(700)
+	if !queue.Enqueue(QueuedPacket{Payload: payload, Priority: true, Expires: p.now.Add(time.Second)}) {
+		t.Fatal("could not enqueue priority packet")
+	}
+	writes := 0
+	if _, err := queue.Pump(p.now, func(Datagram) error { writes++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	stats := queue.Stats()
+	if writes != 0 || stats.MTUDropped != 1 || stats.QueuedPackets != 0 || sender.Stats().MTUNoFit != 1 {
+		t.Fatalf("oversized priority datagram was not rejected cleanly: writes=%d queue=%+v sender=%+v", writes, stats, sender.Stats())
+	}
 }
 
 // deliver pushes datagrams to the opposite side until the exchange settles.
@@ -230,9 +290,9 @@ func TestMTUDiscoveryFindsPerUplinkLimitAndSenderFitsPaths(t *testing.T) {
 	if fit := s.fitPaths(all, 1200); len(fit) != 2 {
 		t.Fatalf("a 1200-byte datagram fits both uplinks, got %d", len(fit))
 	}
-	p.client.paths[PathKey{0, p.srv}].mtu = &MTUProber{ceiling: 1000, strikes: map[int]int{}, outstanding: map[mtuProbeKey]float64{}}
-	if fit := s.fitPaths(all, 1500); len(fit) != 2 || s.stats.MTUNoFit != 1 {
-		t.Fatalf("when nothing fits every path must stay usable, got %d (no_fit=%d)", len(fit), s.stats.MTUNoFit)
+	p.client.paths[PathKey{0, p.srv}].mtu, _ = NewDPLPMTUD(1000, 548)
+	if fit := s.fitPaths(all, 1500); len(fit) != 0 || s.stats.MTUNoFit != 1 {
+		t.Fatalf("RFC 8899 forbids sending when no path fits: got %d (no_fit=%d)", len(fit), s.stats.MTUNoFit)
 	}
 }
 

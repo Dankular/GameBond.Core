@@ -6,16 +6,19 @@ import (
 	"time"
 )
 
-const sessionStateVersion = 3
+const sessionStateVersion = 4
 
-// SessionFailoverState is the packet numbering and recovery state copied from
-// an active GameBond session to a warmed standby. It does not contain keys or
-// path-specific measurements. The destination must already have completed a
-// handshake with this same client session.
+// SessionFailoverState is packet numbering and recovery state copied from an
+// active GameBond session to a warmed standby. DHCP leases remain owned by the
+// shared L2 gateway and are deliberately not copied here. This state contains
+// no keys or path-specific measurements. The destination must already have
+// completed a handshake with this same client session.
 type SessionFailoverState struct {
 	Version        uint8
 	Session        [16]byte
 	Epoch          [16]byte
+	Full           bool
+	BaseRevision   uint64
 	KeyFingerprint [32]byte
 	ClientIP       string
 	OptionsHash    [32]byte
@@ -48,6 +51,7 @@ func (s *Session) SnapshotFailoverState(now time.Time, revision uint64) (Session
 		Version:        sessionStateVersion,
 		Session:        s.Receiver.codec.Session,
 		KeyFingerprint: sha256.Sum256(s.Receiver.codec.key[:]),
+		Full:           true,
 		ClientIP:       s.options.ClientIP.String(),
 		OptionsHash:    optionsHash,
 		MTU:            s.options.MTU,
@@ -79,7 +83,7 @@ func (s *Session) RestoreFailoverState(state SessionFailoverState) error {
 		return ErrRecoveryState
 	}
 	if s.Receiver == nil || s.Receiver.codec == nil || s.Sender == nil ||
-		state.Version != sessionStateVersion || state.Session != s.Receiver.codec.Session ||
+		state.Version != sessionStateVersion || !state.Full || state.BaseRevision != 0 || state.Epoch == ([16]byte{}) || state.Session != s.Receiver.codec.Session ||
 		state.KeyFingerprint != sha256.Sum256(s.Receiver.codec.key[:]) ||
 		state.ClientIP != s.options.ClientIP.String() || state.OptionsHash != optionsHash || state.MTU != s.options.MTU ||
 		state.L2 != s.options.L2 || state.L2FrameMTU != s.options.L2FrameMTU ||
@@ -110,6 +114,50 @@ func (s *Session) RestoreFailoverState(state SessionFailoverState) error {
 	s.Receiver.reorder = reorder
 	s.peer, s.hasPeer = s.Receiver.handshake.peer, true
 	s.stats = state.Stats
+	s.replEpoch, s.replRev = state.Epoch, state.Revision
+	return nil
+}
+
+// ApplyFailoverStateDelta applies one ordered state update after its matching
+// full snapshot. Delta revisions are scoped to the source process epoch.
+func (s *Session) ApplyFailoverStateDelta(state SessionFailoverState) error {
+	if s == nil {
+		return ErrRecoveryState
+	}
+	optionsHash, err := recoveryOptionsHash(s.options)
+	if err != nil || s.Receiver == nil || s.Receiver.codec == nil || s.Receiver.reorder == nil || s.Sender == nil ||
+		state.Version != sessionStateVersion || state.Full || state.Epoch == ([16]byte{}) ||
+		state.Epoch != s.replEpoch || state.BaseRevision == 0 || state.BaseRevision != s.replRev ||
+		state.Revision <= state.BaseRevision || state.Session != s.Receiver.codec.Session ||
+		state.KeyFingerprint != sha256.Sum256(s.Receiver.codec.key[:]) ||
+		state.ClientIP != s.options.ClientIP.String() || state.OptionsHash != optionsHash ||
+		state.MTU != s.options.MTU || state.L2 != s.options.L2 || state.L2FrameMTU != s.options.L2FrameMTU ||
+		len(state.DeviceIPs) != len(s.options.DeviceIPs) || state.CapturedAt.IsZero() || !s.Receiver.handshake.hasPeer {
+		return ErrRecoveryState
+	}
+	for i, ip := range s.options.DeviceIPs {
+		if state.DeviceIPs[i] != ip.String() {
+			return ErrRecoveryState
+		}
+	}
+	if !compatibleReorderConfig(state.Reorder.Config, s.Receiver.reorder.config) {
+		return ErrRecoveryState
+	}
+	state = state.forLocalClock(time.Now())
+	reorder, err := NewReorder(state.Reorder.Config)
+	if err != nil {
+		return ErrRecoveryState
+	}
+	if err := reorder.RestoreState(state.Reorder); err != nil {
+		return err
+	}
+	if err := s.Sender.ApplyReplicatedStateDelta(state.Sender); err != nil {
+		return err
+	}
+	s.Receiver.reorder = reorder
+	s.peer, s.hasPeer = s.Receiver.handshake.peer, true
+	s.stats = state.Stats
+	s.replRev = state.Revision
 	return nil
 }
 
@@ -179,6 +227,7 @@ func (state SessionFailoverState) forLocalClock(now time.Time) SessionFailoverSt
 		state.Sender.Flows[i].Last = shift(state.Sender.Flows[i].Last)
 	}
 	state.Sender.Repairs = append([]RepairEntryState(nil), state.Sender.Repairs...)
+	state.Sender.Removed = append([]MissingPacket(nil), state.Sender.Removed...)
 	for i := range state.Sender.Repairs {
 		state.Sender.Repairs[i].At = shift(state.Sender.Repairs[i].At)
 	}

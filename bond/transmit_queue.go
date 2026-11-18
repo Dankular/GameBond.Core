@@ -2,6 +2,7 @@ package bond
 
 import (
 	"container/list"
+	"errors"
 	"time"
 )
 
@@ -14,6 +15,7 @@ type QueuedPacket struct {
 	ClassCapacity       int
 	queuedAt            time.Time // set on admission; measures queue residency
 	held                bool      // a send was attempted and deferred by pacing or the window
+	fqBucket            uint16    // salted RFC 8290 flow-queue bucket assigned at admission
 }
 type TransmitQueueStats struct {
 	Admitted, Completed, Expired, Rejected, EvictedBulk uint64
@@ -22,6 +24,7 @@ type TransmitQueueStats struct {
 	// ExpiredPriority and ExpiredBulk split Expired by queue: packets that outlived
 	// their class's max age before they could be sent.
 	ExpiredPriority, ExpiredBulk uint64
+	MTUDropped                   uint64
 	// PriorityWaitMaxMS and the over-counters report how long urgent packets
 	// sat in the queue before being written (0 means released immediately).
 	ExpiredInWait, PrioritySent, PriorityWaitOver1ms, PriorityWaitOver5ms uint64
@@ -83,10 +86,17 @@ func (q *TransmitQueue) popBulk() QueuedPacket {
 	q.release(p)
 	return p
 }
+
 // bulkClassFloor is the minimum per-class packet limit for bulk traffic.
 const bulkClassFloor = 2048
 
 func (q *TransmitQueue) Enqueue(packet QueuedPacket) bool {
+	return q.EnqueueAt(packet, time.Now())
+}
+
+// EnqueueAt admits a packet at the caller's event time. Session uses this so
+// queue sojourn, expiry, and CoDel all share the same clock as Pump.
+func (q *TransmitQueue) EnqueueAt(packet QueuedPacket, now time.Time) bool {
 	q.syncPeer()
 	if IsTCPControl(packet.Payload) {
 		packet.Priority = true
@@ -113,16 +123,18 @@ func (q *TransmitQueue) Enqueue(packet QueuedPacket) bool {
 		packet.Priority = true
 	}
 	for q.stats.QueuedPackets >= q.capacity || q.stats.QueuedBytes+len(packet.Payload) > q.byteLimit {
-		if !packet.Priority || q.bulk.Len() == 0 {
+		dropped := q.bulk.EvictLargestBurst(64)
+		if len(dropped) == 0 {
 			q.stats.Rejected++
 			return false
 		}
-		p, _ := q.bulk.EvictLargest()
-		q.release(p)
-		q.stats.EvictedBulk++
+		for _, p := range dropped {
+			q.release(p)
+			q.stats.EvictedBulk++
+		}
 	}
 	packet.Payload = append([]byte(nil), packet.Payload...)
-	packet.queuedAt = time.Now()
+	packet.queuedAt = now
 	if packet.Priority {
 		q.priority.PushBack(packet)
 	} else {
@@ -159,6 +171,11 @@ func (q *TransmitQueue) Pump(now time.Time, writer DatagramWriter) (time.Time, e
 			replicate = q.qos.Replicate(p.Tag, len(p.Payload), replicate, now)
 		}
 		sent, err := q.sender.Urgent(p.Payload, replicate, now, writer)
+		if errors.Is(err, ErrPathMTU) {
+			q.remove(&q.priority)
+			q.stats.MTUDropped++
+			continue
+		}
 		if err != nil {
 			return due, err
 		}
@@ -170,7 +187,7 @@ func (q *TransmitQueue) Pump(now time.Time, writer DatagramWriter) (time.Time, e
 		q.stats.Completed++
 		q.stats.PrioritySent++
 		if !p.queuedAt.IsZero() {
-			ms := float64(time.Since(p.queuedAt)) / float64(time.Millisecond)
+			ms := float64(now.Sub(p.queuedAt)) / float64(time.Millisecond)
 			if ms > q.stats.PriorityWaitMaxMS {
 				q.stats.PriorityWaitMaxMS = ms
 			}
@@ -197,7 +214,7 @@ func (q *TransmitQueue) Pump(now time.Time, writer DatagramWriter) (time.Time, e
 			continue
 		}
 		if q.codel && !p.queuedAt.IsZero() {
-			switch q.codelState.judge(p.Flow, time.Since(p.queuedAt), ecnCapable(p.Payload), time.Now()) {
+			switch q.codelState.judge(fqCoDelKey(p.fqBucket), now.Sub(p.queuedAt), q.bulk.Bytes(), q.sender.r.mtu, ecnCapable(p.Payload), now) {
 			case codelDrop:
 				q.popBulk()
 				q.stats.CoDelDropped++

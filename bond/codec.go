@@ -17,37 +17,39 @@ import (
 )
 
 const (
-	HeaderSize         = 45
-	Overhead           = 61
-	Data          byte = 1
-	Probe         byte = 2
-	Pong          byte = 3
-	Striped       byte = 4
-	Feedback      byte = 5
-	Hello         byte = 6
-	Challenge     byte = 7
-	Reset         byte = 8
-	Ready         byte = 9
-	Repair        byte = 10
-	LinkPolicy    byte = 11
-	LinkPolicyAck byte = 12
-	DataCopy      byte = 13
-	MTUProbeKind  byte = 14
-	MTUAck        byte = 15
-	RepairNA      byte = 16
-	CopyReport    byte = 17
-	Parity        byte = 18
-	BFD           byte = 19
-	ParityRS      byte = 20
-	VersionReq    byte = 21 // client -> server: payload is the client build id
-	VersionInfo   byte = 22 // server -> client: payload is the server build id
-	Supervision   byte = 23 // either way: this side's view of its own paths (IEC 62439-3 supervision)
+	HeaderSize                     = 45
+	Overhead                       = 61
+	Data                      byte = 1
+	Probe                     byte = 2
+	Pong                      byte = 3
+	Striped                   byte = 4
+	Feedback                  byte = 5
+	Hello                     byte = 6
+	Challenge                 byte = 7
+	Reset                     byte = 8
+	Ready                     byte = 9
+	Repair                    byte = 10
+	LinkPolicy                byte = 11
+	LinkPolicyAck             byte = 12
+	DataCopy                  byte = 13
+	MTUProbeKind              byte = 14
+	MTUAck                    byte = 15
+	RepairNA                  byte = 16
+	CopyReport                byte = 17
+	Parity                    byte = 18
+	BFD                       byte = 19
+	ParityRS                  byte = 20
+	VersionReq                byte = 21 // client -> server: payload is the client build id
+	VersionInfo               byte = 22 // server -> client: payload is the server build id
+	Supervision               byte = 23 // either way: this side's view of its own paths (IEC 62439-3 supervision)
+	GatewayProvisioningUpdate byte = 24 // server -> client: versioned topology assignment
 )
 
 var (
 	ErrFrame          = errors.New("invalid GB03 frame")
 	ErrAuthentication = errors.New("GB03 authentication failed")
 	ErrNonceExhausted = errors.New("GB03 nonce domain exhausted")
+	ErrPathMTU        = errors.New("no path can carry datagram within discovered MTU")
 )
 
 type Header struct {
@@ -66,14 +68,14 @@ type rxKey struct {
 }
 
 type Codec struct {
-	key       [32]byte
-	Session   [16]byte
-	Prefix    [16]byte
-	role      string
-	tx        cipher.AEAD
-	sequence  atomic.Uint64
-	rxMutex   sync.Mutex
-	rx        []rxKey
+	key      [32]byte
+	Session  [16]byte
+	Prefix   [16]byte
+	role     string
+	tx       cipher.AEAD
+	sequence atomic.Uint64
+	rxMutex  sync.Mutex
+	rx       []rxKey
 }
 
 func NewCodec(key, session []byte, role string) (*Codec, error) {
@@ -108,7 +110,7 @@ func (c *Codec) derive(prefix [16]byte, role string) (cipher.AEAD, error) {
 }
 
 func (c *Codec) Encode(kind byte, payload []byte) ([]byte, error) {
-	if kind < Data || kind > Supervision || len(payload)+Overhead > 65507 {
+	if kind < Data || kind > GatewayProvisioningUpdate || len(payload)+Overhead > 65507 {
 		return nil, ErrFrame
 	}
 	var sequence uint64
@@ -137,7 +139,7 @@ func (c *Codec) Encode(kind byte, payload []byte) ([]byte, error) {
 func (c *Codec) Decode(frame []byte) (Packet, error) {
 	var result Packet
 	if len(frame) < Overhead || len(frame) > 65507 || string(frame[:4]) != "GB03" ||
-		subtle.ConstantTimeCompare(frame[4:20], c.Session[:]) != 1 || frame[36] < Data || frame[36] > Supervision {
+		subtle.ConstantTimeCompare(frame[4:20], c.Session[:]) != 1 || frame[36] < Data || frame[36] > GatewayProvisioningUpdate {
 		return result, ErrFrame
 	}
 	copy(result.Header.Session[:], frame[4:20])

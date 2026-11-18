@@ -60,6 +60,7 @@ func TestRepairRetainsFlowSequenceUsesFreshNonceAndStopsAfterFour(t *testing.T) 
 		t.Fatal("repair cache did not expire")
 	}
 }
+
 // A repair answer is itself redundancy-worthy: with a third path ready besides the one that
 // lost the packet, the cached payload goes out on two different paths, neither of them the
 // one already proven bad for this packet, so the repair is not a single point of failure the
@@ -179,6 +180,25 @@ func TestTransmitQueueAdmitsUrgentDuringBulkPressureAndOwnsBuffers(t *testing.T)
 		t.Fatal("expired bulk retained", q.Stats())
 	}
 }
+
+func TestTransmitQueueBatchesAdmissionEvictionFromLargestFlow(t *testing.T) {
+	f, s, _ := senderFixture(t, 1)
+	q, _ := NewTransmitQueue(s, 4, 8192)
+	expires := f.now.Add(time.Second)
+	for i := 0; i < 4; i++ {
+		if !q.Enqueue(QueuedPacket{Payload: make([]byte, 100), Flow: "hog", Expires: expires}) {
+			t.Fatal("hog admission failed")
+		}
+	}
+	if !q.Enqueue(QueuedPacket{Payload: make([]byte, 100), Flow: "mouse", Expires: expires}) {
+		t.Fatal("bulk admission should evict a batch from the largest flow")
+	}
+	stats := q.Stats()
+	if stats.EvictedBulk != 2 || stats.QueuedPackets != 3 || stats.QueuedBytes != 300 || stats.Rejected != 0 {
+		t.Fatalf("largest-flow batch eviction stats: %+v", stats)
+	}
+}
+
 func TestMalformedTCPAndFragmentsCannotBypassBulk(t *testing.T) {
 	valid := tcpPacket("")
 	if !IsTCPControl(valid) {

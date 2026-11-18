@@ -211,7 +211,13 @@ func (w *sackWindow) Report() (uint64, []byte) {
 func (r *Receiver) acknowledge(p *receivePath, payload []byte, out *ReceiveResult, sequence, delivered uint64, now float64) bool {
 	var lost []MissingPacket
 	if len(payload) >= feedbackSackSize {
-		lost = p.budget.Sack(binary.BigEndian.Uint64(payload[28:]), payload[36:feedbackSackSize])
+		var outcomes []SackObservation
+		lost, outcomes = p.budget.SackWithObservations(binary.BigEndian.Uint64(payload[28:]), payload[36:feedbackSackSize])
+		if p.mtu != nil {
+			for _, outcome := range outcomes {
+				p.mtu.ObserveDataOutcome(outcome, now)
+			}
+		}
 		if ranges, ok := decodeMissed(payload[feedbackSackSize:]); ok && len(ranges) > 0 {
 			lost = append(lost, p.budget.SackMissed(ranges)...)
 		}

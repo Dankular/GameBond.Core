@@ -22,10 +22,17 @@ type ClientHandshake struct {
 	server          [16]byte
 	hasServer       bool
 	challengePrefix [16]byte
+	provisioning    *GatewayProvisioning
 }
 
 // Pending reports whether a handshake attempt is in flight.
 func (h *ClientHandshake) Pending() bool { return h.hasHello }
+
+// Provisioning returns the last validated topology assignment received from
+// the server. It is nil when the server did not include one.
+func (h *ClientHandshake) Provisioning() *GatewayProvisioning {
+	return cloneGatewayProvisioning(h.provisioning)
+}
 
 // Poll returns the control datagram a client path should send on this tick.
 // Call it only when the path is not ready or has been silent for the path
@@ -62,11 +69,14 @@ type ClientReply struct {
 // unexpected, stale or forged, and changes no state.
 func (h *ClientHandshake) Handle(packet Packet, now time.Time) (reply *ClientReply, ready bool, peer [16]byte, ok bool) {
 	kind, payload := packet.Header.Kind, packet.Payload
-	if (kind != Challenge && kind != Ready) || len(payload) != 32 ||
+	if (kind != Challenge && kind != Ready) || len(payload) < 32 || len(payload) > 32+gatewayProvisioningMaxExtension ||
 		!h.hasHello || now.Sub(h.started) >= handshakeLifetime {
 		return nil, false, peer, false
 	}
 	if kind == Challenge {
+		if len(payload) != 32 {
+			return nil, false, peer, false
+		}
 		if subtle.ConstantTimeCompare(payload[16:], h.hello[:]) != 1 {
 			return nil, false, peer, false
 		}
@@ -76,12 +86,16 @@ func (h *ClientHandshake) Handle(packet Packet, now time.Time) (reply *ClientRep
 		return &ClientReply{Kind: Reset, Payload: append([]byte(nil), payload...)}, false, peer, true
 	}
 	expected := append(append([]byte(nil), h.hello[:]...), h.server[:]...)
-	if !h.hasServer || h.challengePrefix != packet.Header.Prefix ||
-		subtle.ConstantTimeCompare(payload, expected) != 1 {
+	if !h.hasServer || h.challengePrefix != packet.Header.Prefix || len(payload) < len(expected) ||
+		subtle.ConstantTimeCompare(payload[:len(expected)], expected) != 1 {
+		return nil, false, peer, false
+	}
+	provisioning, err := decodeGatewayProvisioning(payload[32:])
+	if err != nil {
 		return nil, false, peer, false
 	}
 	peer = packet.Header.Prefix
-	*h = ClientHandshake{}
+	*h = ClientHandshake{provisioning: provisioning}
 	return nil, true, peer, true
 }
 
